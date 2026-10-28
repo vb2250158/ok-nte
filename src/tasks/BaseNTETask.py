@@ -61,6 +61,8 @@ class BaseNTETask(
 ):
     CONF_CLAIM_REWARD_COUNT = "领取奖励次数"
     DEFAULT_MOVE = False
+    LOGIN_CLICK_LIMIT = 5
+    LOGIN_WAIT_SECONDS = 60
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -71,6 +73,8 @@ class BaseNTETask(
         self.pos = PositionMap(self)
         self._init_char_ui_state()
         self.next_monthly_card_start = 0
+        self._login_wait_started = None
+        self._login_click_count = 0
         self._last_interval_action_time = {}
         self._action_interval_lock = threading.Lock()
         self.scene_flow.interrupt(self.check_monthly_card, self.handle_monthly_card)
@@ -769,11 +773,25 @@ class BaseNTETask(
             self.next_monthly_card_start = 0
 
     def wait_login(self):
+        if self.scene.logged_in() or self.is_in_team():
+            self._login_wait_started = None
+            self._login_click_count = 0
+            return True
+        if self._login_wait_started is not None and (
+            self._login_click_count >= self.LOGIN_CLICK_LIMIT
+            or time.monotonic() - self._login_wait_started >= self.LOGIN_WAIT_SECONDS
+        ):
+            self._login_wait_started = None
+            self._login_click_count = 0
+            message = "Login did not complete within the retry limit; stopping login input."
+            self.log_error(message)
+            raise WaitFailedException(message)
         if not self.scene.logged_in():
-            if self.is_in_team():
-                return True
             self.handle_monthly_card(log=False)
             if self.find_one(Labels.login_setting):
+                if self._login_wait_started is None:
+                    self._login_wait_started = time.monotonic()
+                self._login_click_count += 1
                 self.log_info("found login_setting, bring_to_front and click")
                 if not self.is_foreground():
                     self.bring_to_front()
