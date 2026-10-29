@@ -54,6 +54,13 @@ MOUSE_CONTROL_WARNING = (
 )
 
 
+def _disarm_wd(owner, wd, reason: str) -> None:
+    try:
+        owner.log_info(f"fs-stall-post_teleport disarm reason={reason}")
+    finally:
+        wd.close()
+
+
 class BaseNTETask(
     SceneFlowMixin,
     CharUIMixin,
@@ -420,12 +427,22 @@ class BaseNTETask(
     # Post-teleport budget: FeatureSet/read-image can stall after Labels.teleport
     # (NTE2e hang0825/hang0855). Fail within a few minutes; Esc may have no hwnd.
     POST_TELEPORT_TEAM_TIMEOUT = 180
+    # hang1048: is_in_team can hit the stale pre-teleport HUD ~0.5s after the
+    # teleport click. Ignore in-team hits inside this window (fresh frames only).
+    POST_TELEPORT_FRESH_SECONDS = 3.0
+
+    def disarm_post_teleport_watchdog(self, reason: str) -> None:
+        """Close the phase-scoped post-teleport OS watchdog (idempotent)."""
+        wd = self.__dict__.pop("_post_teleport_wd", None)
+        if wd is not None:
+            _disarm_wd(self, wd, reason)
 
     def wait_in_team_after_teleport(
         self,
         time_out=None,
         raise_if_not_found=True,
         settle_time=0.25,
+        keep_phase_armed=False,
     ):
         """Wait for team HUD after travel with stall budget + fail-closed dump.
 
@@ -442,6 +459,12 @@ class BaseNTETask(
         started = time.time()
         mono_started = time.monotonic()
         self.log_info(f"wait_in_team_after_teleport time_out={time_out}")
+        fresh_after = getattr(
+            type(self), "POST_TELEPORT_FRESH_SECONDS", BaseNTETask.POST_TELEPORT_FRESH_SECONDS
+        )
+        # A previous phase WD (retry) is superseded by this teleport.
+        if "_post_teleport_wd" in self.__dict__:
+            self.disarm_post_teleport_watchdog("superseded_by_new_teleport")
 
         done = threading.Event()
         box = {"success": None, "error": None}
@@ -467,6 +490,9 @@ class BaseNTETask(
                 return None
             elapsed = time.time() - started
             if elapsed >= time_out:
+                return None
+            if elapsed < fresh_after:
+                # hang1048: reject stale-HUD in-team hits right after click.
                 return None
             self.log_info_gated(
                 f"post-teleport wait_in_team elapsed={elapsed:.0f}s/{time_out}",
@@ -509,7 +535,26 @@ class BaseNTETask(
             if time.monotonic() - mono_started >= float(time_out) + 0.5:
                 break
 
-        wd.close()
+        if wd.tripped:
+            reason = "tripped"
+        elif not done.is_set():
+            reason = "wait_budget_exceeded"
+        elif box["error"] is not None:
+            reason = f"error:{type(box['error']).__name__}"
+        elif box["success"]:
+            reason = "in_team"
+        else:
+            reason = "in_team_timeout"
+        if reason == "in_team" and keep_phase_armed:
+            # hang1048: real hang is later (walk/find_one on TaskExecutor).
+            # Keep the OS WD armed until interac/combat is confirmed.
+            self._post_teleport_wd = wd
+            self.log_info(
+                "fs-stall-post_teleport kept armed for post-teleport phase "
+                "(until interac/combat confirmed)"
+            )
+        else:
+            _disarm_wd(self, wd, reason)
         if not done.is_set():
             # External WD (or budget) fired while waiter still blocked in find_one.
             done.set()

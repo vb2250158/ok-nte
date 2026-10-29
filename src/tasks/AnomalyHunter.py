@@ -204,7 +204,7 @@ class AnomalyHunter(BaseStaminaTask, BaseCombatTask):
         y = y_start + page_idx * self.HUNTER_TRAVEL_Y_STEP
         self.operate_click(self.HUNTER_TRAVEL_X, y)
         self.click_traval_button()
-        self.wait_in_team_after_teleport()
+        self.wait_in_team_after_teleport(keep_phase_armed=True)
 
     def turn_to_next_hunter_page(self):
         self.log_info("异象追猎目标位于下一页，执行翻页")
@@ -215,8 +215,12 @@ class AnomalyHunter(BaseStaminaTask, BaseCombatTask):
         self.sleep(0.5)
 
     def enter_hunter(self, target: str):
-        self.sleep(3)
-        self.walk_until_interac_or_combat(script=self.WALK_METHOD.get(target, ["w"]))
+        try:
+            self.sleep(3)
+            self.walk_until_interac_or_combat(script=self.WALK_METHOD.get(target, ["w"]))
+        except BaseException as e:
+            self.disarm_post_teleport_watchdog(f"exception:{type(e).__name__}")
+            raise
         if self.is_in_team() and self.find_interac():
             self.wait_until(
                 lambda: not self.is_in_team(),
@@ -231,8 +235,24 @@ class AnomalyHunter(BaseStaminaTask, BaseCombatTask):
         def cond():
             return self.find_interac() or self.in_combat()
 
-        if cond():
-            return True
+        # hang1048: post-teleport phase WD (armed in wait_in_team_after_teleport)
+        # stays armed until interac/combat is confirmed here; closed on any exit.
+        reason = "exception"
+        try:
+            if cond():
+                reason = "interac_or_combat_confirmed"
+                return True
+            ret = self._walk_until_interac_or_combat_body(
+                cond, script, time_out, run, raise_if_not_found
+            )
+            reason = "interac_or_combat_confirmed" if ret else "walk_timeout"
+            return ret
+        finally:
+            self.disarm_post_teleport_watchdog(reason)
+
+    def _walk_until_interac_or_combat_body(
+        self, cond, script, time_out, run, raise_if_not_found
+    ):
         direction = script[-1]
         ret = False
         try:

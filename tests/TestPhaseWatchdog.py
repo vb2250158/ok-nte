@@ -157,6 +157,7 @@ class TestWaitInTeamAfterTeleport(unittest.TestCase):
 
         class _Task(LogGateMixin):
             POST_TELEPORT_TEAM_TIMEOUT = 180
+            POST_TELEPORT_FRESH_SECONDS = 0.0  # model hang inside is_in_team
 
             def __init__(self):
                 super().__init__()
@@ -206,6 +207,7 @@ class TestWaitInTeamAfterTeleport(unittest.TestCase):
 
         class _Task(LogGateMixin):
             POST_TELEPORT_TEAM_TIMEOUT = 180
+            POST_TELEPORT_FRESH_SECONDS = 0.0  # model hang inside is_in_team
 
             def __init__(self):
                 super().__init__()
@@ -365,6 +367,137 @@ class TestCombatOnceWatchdog(unittest.TestCase):
         # Should exit via NotInCombatException path, not hang
         self.assertIn(status, list(TeamSurvivalStatus))
         task.combat_end.assert_called()
+
+
+def _hunter_task(fresh=0.0, in_team=True):
+    """Minimal AnomalyHunter-like task using real BaseNTETask/AnomalyHunter code."""
+    from src.tasks.AnomalyHunter import AnomalyHunter
+    from src.utils.log_gate import LogGateMixin
+
+    class _Task(LogGateMixin):
+        POST_TELEPORT_TEAM_TIMEOUT = 180
+        POST_TELEPORT_FRESH_SECONDS = fresh
+
+        def __init__(self):
+            super().__init__()
+            self.log_info = Mock()
+            self.log_warning = Mock()
+            self.log_error = Mock()
+            self.sleep = Mock()
+            self.screenshot = Mock()
+            self.send_key = Mock()
+            self.send_key_down = Mock()
+            self.send_key_up = Mock()
+            self.middle_click = Mock()
+            self.ensure_main = Mock()
+            self.executor = Mock()
+            self.executor.connected = Mock(return_value=False)
+            self.executor.exit_event = threading.Event()
+            self.is_in_team = Mock(return_value=in_team)
+            self.in_combat = Mock(return_value=False)
+            self.find_interac = Mock(return_value=False)
+
+        def wait_until(self, cond, time_out=None, raise_if_not_found=False, settle_time=0.25, **kw):
+            end = time.monotonic() + (time_out or 1)
+            while time.monotonic() < end:
+                r = cond()
+                if r:
+                    return r
+                time.sleep(0.02)
+            return None
+
+        disarm_post_teleport_watchdog = BaseNTETask.disarm_post_teleport_watchdog
+        wait_in_team_after_teleport = BaseNTETask.wait_in_team_after_teleport
+        walk_until_interac_or_combat = AnomalyHunter.walk_until_interac_or_combat
+        _walk_until_interac_or_combat_body = AnomalyHunter._walk_until_interac_or_combat_body
+        enter_hunter = AnomalyHunter.enter_hunter
+        WALK_METHOD = {}
+
+    return _Task()
+
+
+def _disarm_logs(task):
+    return [str(c.args[0]) for c in task.log_info.call_args_list
+            if "disarm reason=" in str(c.args[0])]
+
+
+class TestPostTeleportPhaseWatchdog(unittest.TestCase):
+    """hang1048: WD must span teleport click -> interac/combat confirmed."""
+
+    def test_stale_hud_in_team_rejected_inside_fresh_window(self):
+        task = _hunter_task(fresh=10.0)
+        with self.assertRaises(CannotFindException):
+            task.wait_in_team_after_teleport(time_out=0.5)
+        task.is_in_team.assert_not_called()  # before Esc recover (not connected)
+        self.assertEqual(_disarm_logs(task), ["fs-stall-post_teleport disarm reason=in_team_timeout"])
+
+    def test_fresh_in_team_after_window_succeeds(self):
+        task = _hunter_task(fresh=0.2)
+        t0 = time.monotonic()
+        self.assertTrue(task.wait_in_team_after_teleport(time_out=3))
+        self.assertGreaterEqual(time.monotonic() - t0, 0.2)
+        self.assertEqual(_disarm_logs(task), ["fs-stall-post_teleport disarm reason=in_team"])
+
+    def test_phase_kept_armed_then_disarmed_on_combat(self):
+        task = _hunter_task()
+        self.assertTrue(task.wait_in_team_after_teleport(time_out=5, keep_phase_armed=True))
+        wd = task.__dict__["_post_teleport_wd"]
+        self.assertFalse(wd._closed)
+        self.assertEqual(_disarm_logs(task), [])
+        task.in_combat = Mock(side_effect=[False, True])
+        self.assertTrue(task.walk_until_interac_or_combat(script=[["w"]], time_out=2))
+        self.assertTrue(wd._closed)
+        self.assertNotIn("_post_teleport_wd", task.__dict__)
+        self.assertEqual(
+            _disarm_logs(task),
+            ["fs-stall-post_teleport disarm reason=interac_or_combat_confirmed"],
+        )
+
+    def test_phase_disarmed_on_exception(self):
+        task = _hunter_task()
+        task.wait_in_team_after_teleport(time_out=5, keep_phase_armed=True)
+        wd = task.__dict__["_post_teleport_wd"]
+        task.find_interac = Mock(side_effect=RuntimeError("boom"))
+        with self.assertRaises(RuntimeError):
+            task.enter_hunter("x")
+        self.assertTrue(wd._closed)
+        self.assertEqual(_disarm_logs(task), ["fs-stall-post_teleport disarm reason=exception"])
+
+    def test_find_one_hang_after_early_in_team_trips_and_terminates(self):
+        """hang1048 morphology: in-team OK fast, then find_one wedges in walk."""
+        import src.tasks.BaseNTETask as base_mod
+
+        sacrificial = subprocess.Popen(
+            [__import__("sys").executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        real_arm = base_mod.arm_external_watchdog
+
+        def arm_on_sacrificial(**kw):
+            kw.update(target_pid=sacrificial.pid, kill_on_trip=True, grace_seconds=0.3)
+            return real_arm(**kw)
+
+        try:
+            task = _hunter_task()
+            with patch.object(base_mod, "arm_external_watchdog", side_effect=arm_on_sacrificial):
+                self.assertTrue(task.wait_in_team_after_teleport(time_out=1.0, keep_phase_armed=True))
+            wd = task.__dict__["_post_teleport_wd"]
+            self.assertFalse(wd.tripped)
+
+            def wedged_find_one():
+                time.sleep(3.0)  # find_one hang on TaskExecutor (unwatched before)
+                return False
+
+            task.find_interac = Mock(side_effect=wedged_find_one)
+            task.walk_until_interac_or_combat(script=[["w"]], time_out=0.1)
+            self.assertIsNotNone(sacrificial.poll(), "OS WD must terminate target during walk hang")
+            self.assertTrue(wd.tripped)
+            self.assertTrue(task.executor.exit_event.is_set())
+            self.assertTrue(any(("disarm reason=" in m) for m in _disarm_logs(task)))
+        finally:
+            if sacrificial.poll() is None:
+                sacrificial.kill()
+                sacrificial.wait(timeout=2)
 
 
 if __name__ == "__main__":
