@@ -1,3 +1,4 @@
+import subprocess
 import threading
 import time
 import unittest
@@ -195,12 +196,10 @@ class TestWaitInTeamAfterTeleport(unittest.TestCase):
         self.assertIn("stall", warn_msgs.lower())
 
     def test_caller_thread_native_hang_external_watchdog(self):
-        """hang1003: hung stack on caller/wait thread (not GIL-releasing sleep stub).
+        """hang1003/hang1030: helper wedged in is_in_team; OS WD fail-closes.
 
-        Live: TaskExecutor blocked inside find_one after read_from_json OK;
-        join-poll on fs-stall helper never monitored that stack. Busy-spin
-        holds the waiter like a native block; external monotonic WD must
-        fail-closed + exit_event without waiting for the hang to finish.
+        Caller monitors trip marker from OS child; on_trip -> exit_event.
+        Soft path: responsive caller disarms within grace (no self-kill).
         """
         import threading
         from src.utils.log_gate import LogGateMixin
@@ -224,12 +223,10 @@ class TestWaitInTeamAfterTeleport(unittest.TestCase):
                 self.hang_finished = threading.Event()
 
             def is_in_team(self, frame=None):
-                # Native-like: busy-spin holds this thread (GIL in bursts).
-                # time.sleep would release GIL and not match hang1003.
+                # Hold helper like find_one; exit_event lets soft fail-closed end.
                 self.hang_entered.set()
                 end = time.monotonic() + 8.0
                 while time.monotonic() < end:
-                    # CPU-bound slice; do not sleep
                     total = 0
                     for i in range(50000):
                         total += i
@@ -239,8 +236,6 @@ class TestWaitInTeamAfterTeleport(unittest.TestCase):
                 return False
 
             def wait_until(self, cond, time_out=None, raise_if_not_found=False, settle_time=0.25):
-                # Mimic wait_condition: invoke cond on THIS (waiter) thread and
-                # block until it returns — same morphology as live find_one.
                 return cond()
 
         task = _Task()
@@ -251,7 +246,7 @@ class TestWaitInTeamAfterTeleport(unittest.TestCase):
         with self.assertRaises(CannotFindException):
             task.wait_in_team_after_teleport(time_out=0.5)
         elapsed = time.monotonic() - t0
-        self.assertLess(elapsed, 2.5, f"external WD did not fail-closed in time: {elapsed:.2f}s")
+        self.assertLess(elapsed, 3.5, f"external WD did not fail-closed in time: {elapsed:.2f}s")
         self.assertTrue(task.hang_entered.wait(1.0), "hang never entered")
         self.assertTrue(
             task.executor.exit_event.is_set(),
@@ -273,11 +268,52 @@ class TestExternalMonotonicWatchdog(unittest.TestCase):
             seen["elapsed"] = elapsed
             tripped.set()
 
-        wd = arm_external_watchdog(0.3, "unit_post_teleport", on_trip=on_trip)
-        self.assertTrue(tripped.wait(2.0))
+        # Marker-only vs test runner: disarm before grace hard-kill.
+        wd = arm_external_watchdog(
+            0.3,
+            "unit_post_teleport",
+            on_trip=on_trip,
+            kill_on_trip=False,
+        )
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not wd.tripped:
+            time.sleep(0.05)
         self.assertTrue(wd.tripped)
+        self.assertTrue(tripped.is_set())
         wd.close()
         self.assertGreaterEqual(seen.get("elapsed", 0), 0.2)
+
+    def test_os_child_kills_sacrificial_when_not_disarmed(self):
+        """hang1030: if parent never disarms, OS child TerminateProcess target."""
+        sacrificial = subprocess.Popen(
+            [__import__("sys").executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            wd = arm_external_watchdog(
+                0.4,
+                "unit_kill_target",
+                target_pid=sacrificial.pid,
+                kill_on_trip=True,
+                grace_seconds=0.3,
+            )
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and sacrificial.poll() is None:
+                _ = wd.tripped
+                time.sleep(0.05)
+            self.assertIsNotNone(
+                sacrificial.poll(),
+                "OS watchdog must TerminateProcess sacrificial when not disarmed",
+            )
+            self.assertTrue(wd.tripped)
+            # Do not close before observing kill — close after.
+            wd.close()
+        finally:
+            if sacrificial.poll() is None:
+                sacrificial.kill()
+                sacrificial.wait(timeout=2)
 
 
 class TestCombatOnceWatchdog(unittest.TestCase):

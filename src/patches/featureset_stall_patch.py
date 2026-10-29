@@ -10,6 +10,10 @@ Evidence (NTE2e 2026-10-29 Asia/Hong_Kong):
   (not fs-stall-post_teleport helper). join-poll never monitored the hung stack;
   ~398s silence, no fail-closed. Need an EXTERNAL monotonic watchdog that does
   not depend on TaskExecutor returning from find_one.
+- hang1030: tip 489c7d5 ARMED in-process threading WD but never TRIPPED under
+  live find_one/capture hang (interpreter stall); caller mono fallback also
+  silent. OS child process must write trip marker then TerminateProcess parent
+  if disarm never arrives.
 
 Fail the image load within ~3 min so callers can fail-closed with evidence
 instead of waiting DailyRoutine outer timeout.
@@ -17,8 +21,13 @@ instead of waiting DailyRoutine outer timeout.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import tempfile
 import threading
 import time
+import uuid
 
 from ok.util.logger import Logger
 
@@ -26,19 +35,114 @@ logger = Logger.get_logger(__name__)
 
 FEATURESET_READ_TIMEOUT_SECONDS = 180.0
 
+# Grace after trip marker so a responsive caller can poll, fail-closed, and
+# disarm before the OS child hard-kills the target PID (hang1030).
+EXTERNAL_WATCHDOG_KILL_GRACE_SECONDS = 2.0
+
 _PATCH_INSTALLED = False
 _orig_read_from_json = None
+
+# Child script: wall-clock sleep outside parent interpreter (hang1030).
+# argv: timeout label trip_file target_pid grace disarm_file
+_OS_WATCHDOG_CHILD = r"""
+import os
+import sys
+import time
+
+timeout = float(sys.argv[1])
+label = sys.argv[2]
+trip_file = sys.argv[3]
+target_pid = int(sys.argv[4])
+grace = float(sys.argv[5])
+disarm_file = sys.argv[6]
+
+
+def disarmed() -> bool:
+    return os.path.exists(disarm_file)
+
+
+def sleep_until(deadline: float, slice_s: float = 0.1) -> bool:
+    while True:
+        if disarmed():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(slice_s, remaining))
+
+
+started = time.monotonic()
+if sleep_until(started + max(0.0, timeout)):
+    sys.exit(0)
+
+elapsed = time.monotonic() - started
+try:
+    with open(trip_file, "w", encoding="utf-8") as fh:
+        fh.write(
+            f"TRIPPED label={label} after={elapsed:.1f}s "
+            f"target_pid={target_pid}\n"
+        )
+        fh.flush()
+        os.fsync(fh.fileno())
+except Exception:
+    pass
+
+if sleep_until(time.monotonic() + max(0.0, grace), slice_s=0.05):
+    sys.exit(0)
+
+if disarmed():
+    sys.exit(0)
+
+if target_pid > 0:
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            PROCESS_TERMINATE = 0x0001
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_TERMINATE, False, target_pid
+            )
+            if handle:
+                ctypes.windll.kernel32.TerminateProcess(handle, 1)
+                ctypes.windll.kernel32.CloseHandle(handle)
+        else:
+            os.kill(target_pid, 9)
+    except Exception:
+        pass
+sys.exit(1)
+"""
 
 
 class FeatureSetStallError(RuntimeError):
     """Feature template reload exceeded the stall budget."""
 
 
-class ExternalMonotonicWatchdog:
-    """Fail-closed wall clock on a side thread (hang1003).
+def _terminate_pid(pid: int) -> None:
+    if pid <= 0:
+        return
+    try:
+        if sys.platform == "win32":
+            import ctypes
 
-    Does not join the hung callee. Trips via on_trip / tripped flag / exit_event
-    even when TaskExecutor is blocked inside find_one.
+            PROCESS_TERMINATE = 0x0001
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_TERMINATE, False, int(pid)
+            )
+            if handle:
+                ctypes.windll.kernel32.TerminateProcess(handle, 1)
+                ctypes.windll.kernel32.CloseHandle(handle)
+        else:
+            os.kill(int(pid), 9)
+    except Exception:
+        pass
+
+
+class ExternalMonotonicWatchdog:
+    """OS-external fail-closed wall clock (hang1003 / hang1030).
+
+    Spawns a child *process* (not a Python thread) that sleeps on its own
+    monotonic clock, writes a TRIPPED marker, then TerminateProcess(target)
+    after a short grace if not disarmed. Survives parent GIL/native hangs.
     """
 
     def __init__(
@@ -47,15 +151,56 @@ class ExternalMonotonicWatchdog:
         label: str,
         on_trip=None,
         poll_interval: float = 0.2,
+        target_pid: int | None = None,
+        kill_on_trip: bool = True,
+        grace_seconds: float | None = None,
     ):
         self.timeout = max(0.0, float(timeout))
         self.label = label
         self.on_trip = on_trip
         self.poll_interval = max(0.05, float(poll_interval))
-        self.tripped = False
-        self._done = threading.Event()
-        self._thread = None
+        self.target_pid = int(os.getpid() if target_pid is None else target_pid)
+        self.kill_on_trip = bool(kill_on_trip)
+        self.grace_seconds = (
+            EXTERNAL_WATCHDOG_KILL_GRACE_SECONDS
+            if grace_seconds is None
+            else max(0.0, float(grace_seconds))
+        )
         self.started_mono = None
+        self._tripped_latched = False
+        self._on_trip_fired = False
+        self._closed = False
+        self._proc = None
+        self._trip_file = None
+        self._disarm_file = None
+        self._lock = threading.Lock()
+
+    @property
+    def tripped(self) -> bool:
+        self._refresh_trip()
+        return self._tripped_latched
+
+    def _refresh_trip(self) -> None:
+        if self._tripped_latched:
+            return
+        path = self._trip_file
+        if not path or not os.path.exists(path):
+            return
+        with self._lock:
+            if self._tripped_latched:
+                return
+            self._tripped_latched = True
+            elapsed = 0.0
+            if self.started_mono is not None:
+                elapsed = time.monotonic() - self.started_mono
+            if self.on_trip is not None and not self._on_trip_fired:
+                self._on_trip_fired = True
+                try:
+                    self.on_trip(elapsed)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        f"fs-stall-{self.label} on_trip failed: {exc}"
+                    )
 
     def arm(self) -> "ExternalMonotonicWatchdog":
         # Unconditional engagement log so live runs prove wrap is active.
@@ -64,37 +209,71 @@ class ExternalMonotonicWatchdog:
             f"timeout={self.timeout:.0f}s"
         )
         self.started_mono = time.monotonic()
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"fs-stall-{self.label}",
-            daemon=True,
+        unique = uuid.uuid4().hex[:12]
+        base = os.path.join(
+            tempfile.gettempdir(),
+            f"ok-nte-fs-stall-{self.label}-{self.target_pid}-{unique}",
         )
-        self._thread.start()
+        self._trip_file = base + ".trip"
+        self._disarm_file = base + ".disarm"
+        for path in (self._trip_file, self._disarm_file):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+        kill_grace = self.grace_seconds if self.kill_on_trip else 0.0
+        # kill_on_trip False: still write marker, but use huge grace and skip
+        # terminate by pointing target at pid 0 after marker-only mode.
+        target = self.target_pid if self.kill_on_trip else 0
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self._proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _OS_WATCHDOG_CHILD,
+                f"{self.timeout:.6f}",
+                self.label,
+                self._trip_file,
+                str(target),
+                f"{kill_grace:.6f}",
+                self._disarm_file,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+            close_fds=True,
+        )
         return self
 
-    def _run(self) -> None:
-        deadline = (self.started_mono or time.monotonic()) + self.timeout
-        while not self._done.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self.tripped = True
-                elapsed = time.monotonic() - (self.started_mono or deadline)
-                logger.error(
-                    f"fs-stall-{self.label} external watchdog TRIPPED "
-                    f"after {elapsed:.0f}s"
-                )
-                if self.on_trip is not None:
-                    try:
-                        self.on_trip(elapsed)
-                    except Exception as exc:  # noqa: BLE001 - never raise from WD
-                        logger.error(
-                            f"fs-stall-{self.label} on_trip failed: {exc}"
-                        )
-                return
-            self._done.wait(min(self.poll_interval, remaining))
-
     def close(self) -> None:
-        self._done.set()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        # Disarm child before hard kill window.
+        if self._disarm_file:
+            try:
+                with open(self._disarm_file, "w", encoding="utf-8") as fh:
+                    fh.write("disarm\n")
+                    fh.flush()
+            except OSError:
+                pass
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=1.0)
+            except Exception:
+                _terminate_pid(proc.pid)
+        self._refresh_trip()
 
 
 def arm_external_watchdog(
@@ -102,12 +281,18 @@ def arm_external_watchdog(
     label: str,
     on_trip=None,
     poll_interval: float = 0.2,
+    target_pid: int | None = None,
+    kill_on_trip: bool = True,
+    grace_seconds: float | None = None,
 ) -> ExternalMonotonicWatchdog:
     return ExternalMonotonicWatchdog(
         timeout=timeout,
         label=label,
         on_trip=on_trip,
         poll_interval=poll_interval,
+        target_pid=target_pid,
+        kill_on_trip=kill_on_trip,
+        grace_seconds=grace_seconds,
     ).arm()
 
 
@@ -153,8 +338,9 @@ def _run_with_timeout(
     alive while the callee (e.g. is_in_team/find_one) is wedged after
     read_from_json already returned OK (hang0938).
 
-    hang1003: this alone is insufficient when the hung stack is the caller
-    (TaskExecutor) itself — use ExternalMonotonicWatchdog for that case.
+    hang1003/hang1030: this alone is insufficient when the hung stack is the
+    caller (TaskExecutor) itself or the whole interpreter — use
+    ExternalMonotonicWatchdog (OS child) for post-teleport.
     """
     result = []
     error = []

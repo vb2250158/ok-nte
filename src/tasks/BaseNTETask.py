@@ -432,10 +432,10 @@ class BaseNTETask(
         Esc recover is best-effort (hang0855: no window handle). Always dump a
         screenshot on stall so outer DailyRoutine does not sit 30-60 min.
 
-        hang1003: find_one can block ON TaskExecutor after read_from_json OK.
-        An EXTERNAL monotonic watchdog (side thread -> exit_event) fail-closes
-        without depending on TaskExecutor returning from find_one. The wait body
-        runs on a helper so the caller only monitors done/tripped.
+        hang1003/hang1030: find_one can block after read_from_json OK; an
+        OS-external monotonic watchdog (child process -> trip file / hard kill)
+        fail-closes even if the interpreter is stalled. The wait body runs on a
+        helper so the caller only monitors done/tripped and can disarm in grace.
         """
         if time_out is None:
             time_out = self.POST_TELEPORT_TEAM_TIMEOUT
