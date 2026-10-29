@@ -67,10 +67,27 @@ class DailyClaimTask(BaseStaminaTask):
         self.open_mail_panel()
         self.operate_click(0.1289, 0.9299)
         self.sleep(1)
-        return True
+        # Leave mail UI so activity/F1 path sees team HUD (NTE2d: mail overlay blocked F1).
+        self.ensure_main()
+        if not self.is_in_team():
+            self.log_warning("claim_mail: still not in team after ensure_main; retry")
+            self.ensure_main()
+        return bool(self.is_in_team())
+
+    def _ensure_main_for_f1(self) -> bool:
+        """Leave overlays (mail/etc.) and require team HUD before activity F1."""
+        self.ensure_main()
+        if self.is_in_team():
+            return True
+        self.log_warning("not in team before F1; recovering overlays")
+        self.ensure_main()
+        return bool(self.is_in_team())
 
     def claim_activity_rewards(self):
         self.log_info("正在领取活跃度奖励")
+        if not self._ensure_main_for_f1():
+            self.log_error("无法回到主界面/编队，跳过活跃度领取")
+            return False
         if not self.open_activity_panel():
             return False
         if self.find_one(Labels.f1_activity_mission):

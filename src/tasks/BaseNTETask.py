@@ -619,13 +619,32 @@ class BaseNTETask(
 
     def openF1panel(self):
         def action():
-            if self.is_in_team():
-                self.send_key("f1", after_sleep=1)
-                self.log_info("send f1 key to open the panel")
-            return self.wait_panel(Labels.f1_panel)
+            # Panel may already be open (overlay hides team HUD). Accept it first.
+            existing = self.find_one(Labels.f1_panel)
+            if existing:
+                return existing
+            if not self.is_in_team():
+                # Do not wait for f1_panel without sending F1; recover via ensure_main.
+                self.log_warning("openF1panel: not in team; recover overlays before F1")
+                return None
+            self.send_key("f1", after_sleep=1)
+            self.log_info("send f1 key to open the panel")
+            panel = self.wait_panel(Labels.f1_panel)
+            if not panel:
+                # Optional frame dump when key was sent but template missed.
+                try:
+                    self.screenshot("openF1panel_miss")
+                    self.log_warning("openF1panel: Labels.f1_panel miss after F1; dumped frame")
+                except Exception as e:
+                    self.log_warning(f"openF1panel: miss dump failed: {e}")
+            return panel
 
         result = self.retry_on_action(action, self.ensure_main)
         if not result:
+            try:
+                self.screenshot("openF1panel_fail")
+            except Exception:
+                pass
             self.log_error("can't find panel, make sure f1 is the hotkey for panel", notify=True)
             raise CannotFindException("can't find panel, make sure f1 is the hotkey for panel")
         self.sleep(0.5)
