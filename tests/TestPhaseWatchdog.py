@@ -108,6 +108,40 @@ class TestWaitInTeamAfterTeleport(unittest.TestCase):
         task.screenshot.assert_called_with("post_teleport_stall")
 
 
+
+    def test_cond_log_info_gated_key_does_not_typeerror(self):
+        """Live bug: cond() called log_info_gated(..., key=) and TypeError aborted wait."""
+        from src.utils.log_gate import LogGateMixin
+
+        class _Task(LogGateMixin):
+            POST_TELEPORT_TEAM_TIMEOUT = 180
+
+            def __init__(self):
+                super().__init__()
+                self.log_info = Mock()
+                self.log_warning = Mock()
+                self.log_error = Mock()
+                self.sleep = Mock()
+                self.screenshot = Mock()
+                self.send_key = Mock()
+                self.ensure_main = Mock()
+                self.is_in_team = Mock(return_value=True)
+                self.executor = Mock()
+                self.executor.connected = Mock(return_value=True)
+
+            def wait_until(self, cond, time_out=None, raise_if_not_found=False, settle_time=0.25):
+                # Invoke real cond once so log_info_gated(key=...) runs
+                return bool(cond())
+
+        task = _Task()
+        task.wait_in_team_after_teleport = (
+            BaseNTETask.wait_in_team_after_teleport.__get__(task, BaseNTETask)
+        )
+        # Must not raise TypeError on unexpected keyword argument key
+        result = task.wait_in_team_after_teleport(time_out=1)
+        self.assertTrue(result)
+
+
 class TestCombatOnceWatchdog(unittest.TestCase):
     def test_idle_timeout_raises_before_perform(self):
         task = BaseCombatTask.__new__(BaseCombatTask)

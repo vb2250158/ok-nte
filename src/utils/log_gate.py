@@ -234,12 +234,14 @@ class LogGateMixin:
         interval: float | None = 1.0,
         changed: bool = False,
         notify: bool = False,
+        key: Any = None,
     ) -> bool:
         return self._log_gate.info(
             message,
             interval=interval,
             changed=changed,
             notify=notify,
+            key=key,
             stacklevel=2,
         )
 
@@ -249,12 +251,14 @@ class LogGateMixin:
         interval: float | None = 1.0,
         changed: bool = False,
         notify: bool = False,
+        key: Any = None,
     ) -> bool:
         return self._log_gate.debug(
             message,
             interval=interval,
             changed=changed,
             notify=notify,
+            key=key,
             stacklevel=2,
         )
 
@@ -264,12 +268,14 @@ class LogGateMixin:
         interval: float | None = 1.0,
         changed: bool = False,
         notify: bool = False,
+        key: Any = None,
     ) -> bool:
         return self._log_gate.warning(
             message,
             interval=interval,
             changed=changed,
             notify=notify,
+            key=key,
             stacklevel=2,
         )
 
@@ -280,6 +286,7 @@ class LogGateMixin:
         changed: bool = False,
         exception: Exception | None = None,
         notify: bool = False,
+        key: Any = None,
     ) -> bool:
         return self._log_gate.error(
             message,
@@ -287,5 +294,6 @@ class LogGateMixin:
             changed=changed,
             exception=exception,
             notify=notify,
+            key=key,
             stacklevel=2,
         )

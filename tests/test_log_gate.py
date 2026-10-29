@@ -1,6 +1,6 @@
 import unittest
 
-from src.utils.log_gate import LogGate
+from src.utils.log_gate import LogGate, LogGateMixin
 
 
 class _Clock:
@@ -93,6 +93,56 @@ class LogGateTests(unittest.TestCase):
         self.assertTrue(gate.error("failed", interval=1.0, exception=error))
 
         self.assertEqual(logger.calls, [("error", "failed", error)])
+
+
+
+
+class _TaskLogger(LogGateMixin):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def log_info(self, message, notify=False):
+        self.calls.append(("info", message, notify))
+
+    def log_debug(self, message, notify=False):
+        self.calls.append(("debug", message, notify))
+
+    def log_warning(self, message, notify=False):
+        self.calls.append(("warning", message, notify))
+
+    def log_error(self, message, exception=None, notify=False):
+        self.calls.append(("error", message, exception, notify))
+
+
+class LogGateMixinKeyTests(unittest.TestCase):
+    def test_log_info_gated_accepts_explicit_key(self):
+        """Regression: wait_in_team_after_teleport passes key=; mixin must forward it."""
+        task = _TaskLogger()
+        # Would raise TypeError before fix: unexpected keyword argument key
+        self.assertTrue(
+            task.log_info_gated(
+                "post-teleport wait_in_team elapsed=0s/180",
+                interval=15,
+                key="post_teleport_wait",
+            )
+        )
+        self.assertFalse(
+            task.log_info_gated(
+                "post-teleport wait_in_team elapsed=1s/180",
+                interval=15,
+                key="post_teleport_wait",
+            )
+        )
+        self.assertEqual(len(task.calls), 1)
+        self.assertEqual(task.calls[0][0], "info")
+
+    def test_explicit_key_shared_across_call_sites(self):
+        task = _TaskLogger()
+        self.assertTrue(task.log_info_gated("a", interval=10, key="shared"))
+        # Different Python callsite but same explicit key -> still throttled
+        self.assertFalse(task.log_info_gated("b", interval=10, key="shared"))
+        self.assertEqual(len(task.calls), 1)
 
 
 if __name__ == "__main__":
