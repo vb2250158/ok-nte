@@ -142,7 +142,57 @@ class TestWaitInTeamAfterTeleport(unittest.TestCase):
         self.assertTrue(result)
 
 
+
+    def test_is_in_team_hang_fails_closed_within_budget(self):
+        """hang0938: if is_in_team/find_one blocks past budget, wait fails closed.
+
+        wait_condition only checks the 180s budget AFTER condition() returns, so
+        a wedged find_one starved the outer timeout. Bounded is_in_team must trip.
+        """
+        from src.utils.log_gate import LogGateMixin
+
+        class _Task(LogGateMixin):
+            POST_TELEPORT_TEAM_TIMEOUT = 180
+
+            def __init__(self):
+                super().__init__()
+                self.log_info = Mock()
+                self.log_warning = Mock()
+                self.log_error = Mock()
+                self.sleep = Mock()
+                self.screenshot = Mock()
+                self.send_key = Mock()
+                self.ensure_main = Mock()
+                self.executor = Mock()
+                self.executor.connected = Mock(return_value=False)
+
+            def is_in_team(self, frame=None):
+                # Simulate find_one wedged after read_from_json ok
+                time.sleep(5.0)
+                return False
+
+            def wait_until(self, cond, time_out=None, raise_if_not_found=False, settle_time=0.25):
+                # Real wait_until would invoke cond; call once like production loop
+                return cond()
+
+        task = _Task()
+        task.wait_in_team_after_teleport = (
+            BaseNTETask.wait_in_team_after_teleport.__get__(task, BaseNTETask)
+        )
+        t0 = time.time()
+        with self.assertRaises(CannotFindException):
+            task.wait_in_team_after_teleport(time_out=0.4)
+        elapsed = time.time() - t0
+        # Must fail closed near budget, not sit on the 5s hang
+        self.assertLess(elapsed, 2.5)
+        task.screenshot.assert_called_with("post_teleport_stall")
+        # Stall path logged
+        warn_msgs = " ".join(str(c) for c in task.log_warning.call_args_list)
+        self.assertIn("stall", warn_msgs.lower())
+
+
 class TestCombatOnceWatchdog(unittest.TestCase):
+
     def test_idle_timeout_raises_before_perform(self):
         task = BaseCombatTask.__new__(BaseCombatTask)
         task.chars = []

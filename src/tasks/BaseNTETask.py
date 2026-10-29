@@ -30,6 +30,10 @@ from src.tasks.mixin.VisionMixin import VisionMixin
 from src.utils import image_utils as iu
 from src.utils import vision_utils as vu
 from src.utils.log_gate import LogGateMixin
+from src.patches.featureset_stall_patch import (
+    FeatureSetStallError,
+    _run_with_timeout,
+)
 
 logger = Logger.get_logger(__name__)
 stamina_re = re.compile(r"(\d+)/(\d+)")
@@ -432,14 +436,35 @@ class BaseNTETask(
         started = time.time()
         self.log_info(f"wait_in_team_after_teleport time_out={time_out}")
 
+        def _heartbeat(blocked_for: float) -> None:
+            # Keep gated elapsed alive while is_in_team/find_one is wedged
+            # (hang0938: wait_condition only checks budget AFTER condition returns).
+            elapsed = time.time() - started
+            self.log_info_gated(
+                f"post-teleport wait_in_team elapsed={elapsed:.0f}s/{time_out} "
+                f"(is_in_team blocked {blocked_for:.0f}s)",
+                interval=15,
+                key="post_teleport_wait",
+            )
+
         def cond():
             elapsed = time.time() - started
+            remaining = time_out - elapsed
+            if remaining <= 0:
+                return None
             self.log_info_gated(
                 f"post-teleport wait_in_team elapsed={elapsed:.0f}s/{time_out}",
                 interval=15,
                 key="post_teleport_wait",
             )
-            return self.is_in_team()
+            # Wall-clock around full is_in_team/find_one path (not only read_from_json).
+            return _run_with_timeout(
+                lambda: self.is_in_team(),
+                remaining,
+                "post_teleport_is_in_team",
+                on_heartbeat=_heartbeat,
+                heartbeat_interval=15.0,
+            )
 
         try:
             success = self.wait_until(
@@ -448,8 +473,11 @@ class BaseNTETask(
                 raise_if_not_found=False,
                 settle_time=settle_time,
             )
+        except FeatureSetStallError as e:
+            self.log_warning(f"post-teleport is_in_team stall fail-closed: {e}")
+            success = None
         except Exception as e:
-            # FeatureSetStallError or capture errors during find
+            # capture errors during find
             self.log_warning(f"post-teleport wait raised: {e}")
             success = None
 

@@ -28,7 +28,20 @@ class FeatureSetStallError(RuntimeError):
     """Feature template reload exceeded the stall budget."""
 
 
-def _run_with_timeout(func, timeout: float, label: str):
+def _run_with_timeout(
+    func,
+    timeout: float,
+    label: str,
+    on_heartbeat=None,
+    heartbeat_interval: float = 15.0,
+    poll_interval: float = 1.0,
+):
+    """Run `func` on a daemon thread; fail closed if it exceeds `timeout`.
+
+    Polls `join` so optional `on_heartbeat` can keep gated elapsed logs
+    alive while the callee (e.g. is_in_team/find_one) is wedged after
+    read_from_json already returned OK (hang0938).
+    """
     result = []
     error = []
 
@@ -40,11 +53,22 @@ def _run_with_timeout(func, timeout: float, label: str):
 
     thread = threading.Thread(target=_target, name=f"fs-stall-{label}", daemon=True)
     thread.start()
-    thread.join(timeout)
-    if thread.is_alive():
-        raise FeatureSetStallError(
-            f"FeatureSet {label} stall timeout after {timeout:.0f}s"
-        )
+    started = time.monotonic()
+    last_hb = started
+    deadline = started + max(0.0, timeout)
+    while thread.is_alive():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise FeatureSetStallError(
+                f"FeatureSet {label} stall timeout after {timeout:.0f}s"
+            )
+        thread.join(min(poll_interval, remaining))
+        if on_heartbeat is None or heartbeat_interval <= 0:
+            continue
+        now = time.monotonic()
+        if now - last_hb >= heartbeat_interval:
+            last_hb = now
+            on_heartbeat(time.monotonic() - started)
     if error:
         raise error[0]
     return result[0] if result else None
