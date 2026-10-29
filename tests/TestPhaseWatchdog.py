@@ -285,6 +285,52 @@ class TestExternalMonotonicWatchdog(unittest.TestCase):
         wd.close()
         self.assertGreaterEqual(seen.get("elapsed", 0), 0.2)
 
+    def test_stack_dump_written_when_target_hangs(self):
+        """Diagnostic: self-targeted watchdog dumps all-thread stacks before kill."""
+        import os as _os
+        import sys as _sys
+
+        repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        code = (
+            "import sys, time\n"
+            f"sys.path.insert(0, {repo!r})\n"
+            "from src.patches.featureset_stall_patch import arm_external_watchdog\n"
+            "wd = arm_external_watchdog(1.5, 'unit_stack', grace_seconds=1.0)\n"
+            "print('STACKFILE=' + wd.stack_file, flush=True)\n"
+            "def frozen_find_one():\n"
+            "    time.sleep(60)\n"
+            "frozen_find_one()\n"
+        )
+        proc = subprocess.Popen(
+            [_sys.executable, "-c", code],
+            cwd=repo,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            path = ""
+            for line in proc.stdout:
+                if line.startswith("STACKFILE="):
+                    path = line.strip()[len("STACKFILE="):]
+                    break
+            proc.stdout.close()
+            self.assertTrue(path.endswith(".stack.txt"), path)
+            proc.wait(timeout=20)
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                body = fh.read()
+            self.assertIn("frozen_find_one", body)
+            self.assertIn("Thread", body)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
+            try:
+                _os.remove(path)
+            except Exception:
+                pass
+
     def test_os_child_kills_sacrificial_when_not_disarmed(self):
         """hang1030: if parent never disarms, OS child TerminateProcess target."""
         sacrificial = subprocess.Popen(

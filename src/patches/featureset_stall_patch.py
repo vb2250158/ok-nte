@@ -21,6 +21,7 @@ instead of waiting DailyRoutine outer timeout.
 
 from __future__ import annotations
 
+import faulthandler
 import os
 import subprocess
 import sys
@@ -174,6 +175,9 @@ class ExternalMonotonicWatchdog:
         self._trip_file = None
         self._disarm_file = None
         self._lock = threading.Lock()
+        # Diagnostic-only: all-thread stack dump before OS child kills us.
+        self.stack_file = None
+        self._stack_fh = None
 
     @property
     def tripped(self) -> bool:
@@ -223,6 +227,8 @@ class ExternalMonotonicWatchdog:
             except OSError:
                 pass
 
+        self._arm_stack_dump(base)
+
         kill_grace = self.grace_seconds if self.kill_on_trip else 0.0
         # kill_on_trip False: still write marker, but use huge grace and skip
         # terminate by pointing target at pid 0 after marker-only mode.
@@ -250,11 +256,53 @@ class ExternalMonotonicWatchdog:
         )
         return self
 
+    def _arm_stack_dump(self, base: str) -> None:
+        """Diagnostic only: faulthandler dumps all Python thread stacks from
+        its own C thread (no GIL needed) shortly before the OS child trips,
+        so a frozen TaskExecutor stack survives the hard kill."""
+        if self.target_pid != os.getpid() or self.timeout <= 0:
+            return
+        lead = min(5.0, self.timeout / 2.0)
+        delay = max(0.05, self.timeout - lead)
+        path = base + f"-{time.strftime('%Y%m%d-%H%M%S')}.stack.txt"
+        try:
+            fh = open(path, "w", encoding="utf-8")
+            fh.write(
+                f"ok-nte stack dump label={self.label} pid={self.target_pid} "
+                f"timeout={self.timeout:.1f}s dump_after={delay:.1f}s\n"
+            )
+            fh.flush()
+            faulthandler.dump_traceback_later(delay, repeat=False, file=fh, exit=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"fs-stall-{self.label} stack dump arm failed: {exc}")
+            return
+        self._stack_fh = fh
+        self.stack_file = path
+        logger.info(
+            f"fs-stall-{self.label} stack dump armed after={delay:.1f}s "
+            f"file={path}"
+        )
+
+    def _cancel_stack_dump(self) -> None:
+        fh = self._stack_fh
+        if fh is None:
+            return
+        self._stack_fh = None
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except Exception:
+            pass
+        try:
+            fh.close()
+        except Exception:
+            pass
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+        self._cancel_stack_dump()
         # Disarm child before hard kill window.
         if self._disarm_file:
             try:
