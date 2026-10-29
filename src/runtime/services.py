@@ -16,6 +16,8 @@ class RuntimeServices:
     # Bounded first wait for the detector. Callers poll every frame, so after
     # this one wait the model is only picked up once ready (never blocks again).
     OPENVINO_WAIT_TIMEOUT = 3.0
+    # Pre-teleport/walk prewarm may wait longer so compile never starts mid-hunt.
+    OPENVINO_PREWARM_TIMEOUT = 30.0
 
     def __init__(self) -> None:
         if threading.current_thread() is not threading.main_thread():
@@ -130,6 +132,30 @@ class RuntimeServices:
         model = self.openvino_model_async
         if model is not None:
             model.clear_cache()
+
+    def ensure_openvino_ready(self, timeout: float | None = None) -> bool:
+        """Start loader if needed and wait until ready (or timeout).
+
+        Used before teleport/walk so GPU/CPU compile cannot race the hunt.
+        """
+        if self._openvino_model_async is not None:
+            return bool(getattr(self._openvino_model_async, "_openvino_available", False))
+        self._ensure_openvino_init()
+        wait = self.OPENVINO_PREWARM_TIMEOUT if timeout is None else float(timeout)
+        try:
+            model = self._openvino_model_future.result(timeout=wait)
+        except FutureTimeoutError:
+            logger.warning(
+                f"OpenVINO prewarm not ready after {wait:.1f}s; continuing without detector"
+            )
+            return False
+        except (CancelledError, Exception) as error:
+            logger.warning(f"OpenVINO prewarm unavailable: {error!r}")
+            return False
+        ready = bool(model is not None and getattr(model, "_openvino_available", False))
+        device = getattr(model, "device", None) if model is not None else None
+        logger.info(f"OpenVINO prewarm ready={ready} device={device}")
+        return ready
 
     def _init_sound_context(self) -> None:
         from src.sound_trigger.SoundCombatContext import SoundCombatContext

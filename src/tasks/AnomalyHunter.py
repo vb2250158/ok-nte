@@ -216,6 +216,8 @@ class AnomalyHunter(BaseStaminaTask, BaseCombatTask):
 
     def enter_hunter(self, target: str):
         try:
+            # Finish OpenVINO compile before movement so it cannot race WGC/4K GPU.
+            self.ensure_openvino_ready()
             self.sleep(3)
             self.walk_until_interac_or_combat(script=self.WALK_METHOD.get(target, ["w"]))
         except BaseException as e:
@@ -233,6 +235,23 @@ class AnomalyHunter(BaseStaminaTask, BaseCombatTask):
         self, script=[["w"]], time_out=10, run=False, raise_if_not_found=False
     ):
         def cond():
+            if self.is_game_app_hang():
+                from ok import TaskDisabledException
+
+                raise TaskDisabledException(
+                    f"FAIL_CLOSED game_app_hang during hunt: {self.game_window_title()}"
+                )
+            age = self.capture_frame_age_seconds()
+            if age is not None and age > 5.0:
+                from ok import TaskDisabledException
+
+                raise TaskDisabledException(
+                    f"FAIL_CLOSED hunt_no_frames age={age:.1f}s"
+                )
+            if not self.is_hwnd_present_and_visible():
+                from ok import TaskDisabledException
+
+                raise TaskDisabledException("FAIL_CLOSED hwnd_not_visible during hunt")
             return self.find_interac() or self.in_combat()
 
         # hang1048: post-teleport phase WD (armed in wait_in_team_after_teleport)
@@ -242,6 +261,18 @@ class AnomalyHunter(BaseStaminaTask, BaseCombatTask):
             if cond():
                 reason = "interac_or_combat_confirmed"
                 return True
+            ready, gate_reason = self.ensure_capture_ready_for_walk()
+            if not ready:
+                self.log_warning(
+                    f"walk gated fail-closed before key-down: {gate_reason}",
+                    notify=True,
+                )
+                reason = f"walk_gate:{gate_reason}"
+                if "hang" in gate_reason:
+                    from ok import TaskDisabledException
+
+                    raise TaskDisabledException(f"FAIL_CLOSED {gate_reason}")
+                return False
             ret = self._walk_until_interac_or_combat_body(
                 cond, script, time_out, run, raise_if_not_found
             )

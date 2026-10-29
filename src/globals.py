@@ -223,6 +223,9 @@ class Globals:
     def openvino_clear_cache(self):
         self._runtime_services.openvino_clear_cache()
 
+    def ensure_openvino_ready(self, timeout=None) -> bool:
+        return self._runtime_services.ensure_openvino_ready(timeout=timeout)
+
     @property
     def _openvino_model_async(self):
         return self._runtime_services._openvino_model_async

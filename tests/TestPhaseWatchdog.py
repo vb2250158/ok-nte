@@ -443,6 +443,13 @@ def _hunter_task(fresh=0.0, in_team=True):
             self.is_in_team = Mock(return_value=in_team)
             self.in_combat = Mock(return_value=False)
             self.find_interac = Mock(return_value=False)
+            # nte-gpu-walk-gate helpers used by enter_hunter / walk gate
+            self.ensure_openvino_ready = Mock(return_value=True)
+            self.is_game_app_hang = Mock(return_value=False)
+            self.game_window_title = Mock(return_value="HTGame")
+            self.capture_frame_age_seconds = Mock(return_value=0.1)
+            self.is_hwnd_present_and_visible = Mock(return_value=True)
+            self.ensure_capture_ready_for_walk = Mock(return_value=(True, "ok"))
 
         def wait_until(self, cond, time_out=None, raise_if_not_found=False, settle_time=0.25, **kw):
             end = time.monotonic() + (time_out or 1)

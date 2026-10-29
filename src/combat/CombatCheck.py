@@ -195,7 +195,8 @@ class CombatCheck(BaseNTETask):
         max_width = self.width_of_screen(200 / 2560)
 
         # 还原原始的颜色过滤
-        _frame = iu.filter_by_hsv(self.frame, enemy_health_hsv)
+        frame = iu.as_numpy(self.frame)
+        _frame = iu.as_numpy(iu.filter_by_hsv(frame, enemy_health_hsv))
         boxes = find_color_rectangles(
             _frame,
             enemy_health_color_red,

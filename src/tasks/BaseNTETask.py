@@ -188,6 +188,97 @@ class BaseNTETask(
     def openvino_available(self):
         return getattr(og.my_app, "openvino_available", None)
 
+    def ensure_openvino_ready(self, timeout=None) -> bool:
+        app = getattr(og, "my_app", None)
+        if app is None:
+            return False
+        ensure = getattr(app, "ensure_openvino_ready", None)
+        if not callable(ensure):
+            return bool(self.openvino_available)
+        return bool(ensure(timeout=timeout))
+
+    def _hwnd_window(self):
+        device_manager = getattr(og, "device_manager", None)
+        return getattr(device_manager, "hwnd_window", None)
+
+    def game_window_title(self) -> str:
+        hwnd_window = self._hwnd_window()
+        if hwnd_window is None:
+            return ""
+        hwnd = getattr(hwnd_window, "hwnd", 0) or 0
+        if hwnd:
+            try:
+                import win32gui
+
+                return win32gui.GetWindowText(hwnd) or ""
+            except Exception:
+                pass
+        return str(getattr(hwnd_window, "hwnd_title", "") or "")
+
+    def is_game_app_hang(self) -> bool:
+        title = self.game_window_title()
+        return "hang" in title.lower()
+
+    def is_hwnd_present_and_visible(self) -> bool:
+        hwnd_window = self._hwnd_window()
+        if hwnd_window is None:
+            return False
+        hwnd = getattr(hwnd_window, "hwnd", 0) or 0
+        if not hwnd or not getattr(hwnd_window, "exists", False):
+            return False
+        try:
+            import win32gui
+
+            return bool(win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd))
+        except Exception:
+            return bool(getattr(hwnd_window, "exists", False))
+
+    def capture_frame_age_seconds(self) -> float | None:
+        device_manager = getattr(og, "device_manager", None)
+        method = getattr(device_manager, "capture_method", None)
+        last = getattr(method, "last_frame_time", None)
+        if last is None:
+            return None
+        try:
+            return max(0.0, time.time() - float(last))
+        except Exception:
+            return None
+
+    def ensure_capture_ready_for_walk(
+        self,
+        settle_seconds: float = 0.6,
+        min_frames: int = 2,
+        max_frame_age: float = 2.0,
+    ) -> tuple[bool, str]:
+        """Fail-closed gate before holding movement keys (NTE2e-6f6d)."""
+        if self.is_game_app_hang():
+            return False, f"game_app_hang:{self.game_window_title()}"
+        if not self.is_hwnd_present_and_visible():
+            return False, "hwnd_not_visible"
+        got = 0
+        deadline = time.monotonic() + float(settle_seconds)
+        while True:
+            age = self.capture_frame_age_seconds()
+            frame = getattr(self, "frame", None)
+            if frame is not None and (age is None or age <= max_frame_age):
+                got += 1
+                if got >= min_frames:
+                    return True, "ok"
+            if time.monotonic() >= deadline and got < min_frames:
+                break
+            try:
+                self.sleep(0.05)
+            except Exception:
+                time.sleep(0.05)
+            if time.monotonic() >= deadline and got >= 1:
+                # Accept a single fresh frame after settle budget.
+                if frame is not None and (age is None or age <= max_frame_age):
+                    return True, "ok"
+                break
+        if got == 0:
+            return False, "no_frames"
+        return False, "unstable_frames"
+
     def parse_ocr_number(self, ocr_result) -> int:
         if not ocr_result:
             return 0
