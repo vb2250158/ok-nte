@@ -30,6 +30,11 @@ from src.tasks.mixin.VisionMixin import VisionMixin
 from src.utils import image_utils as iu
 from src.utils import vision_utils as vu
 from src.utils.log_gate import LogGateMixin
+from src.patches.featureset_stall_patch import (
+    FeatureSetStallError,
+    arm_external_watchdog,
+    signal_exit_event,
+)
 
 logger = Logger.get_logger(__name__)
 stamina_re = re.compile(r"(\d+)/(\d+)")
@@ -49,6 +54,13 @@ MOUSE_CONTROL_WARNING = (
 )
 
 
+def _disarm_wd(owner, wd, reason: str) -> None:
+    try:
+        owner.log_info(f"fs-stall-post_teleport disarm reason={reason}")
+    finally:
+        wd.close()
+
+
 class BaseNTETask(
     SceneFlowMixin,
     CharUIMixin,
@@ -61,6 +73,8 @@ class BaseNTETask(
 ):
     CONF_CLAIM_REWARD_COUNT = "领取奖励次数"
     DEFAULT_MOVE = False
+    LOGIN_CLICK_LIMIT = 5
+    LOGIN_WAIT_SECONDS = 60
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -71,6 +85,8 @@ class BaseNTETask(
         self.pos = PositionMap(self)
         self._init_char_ui_state()
         self.next_monthly_card_start = 0
+        self._login_wait_started = None
+        self._login_click_count = 0
         self._last_interval_action_time = {}
         self._action_interval_lock = threading.Lock()
         self.scene_flow.interrupt(self.check_monthly_card, self.handle_monthly_card)
@@ -171,6 +187,97 @@ class BaseNTETask(
     @property
     def openvino_available(self):
         return getattr(og.my_app, "openvino_available", None)
+
+    def ensure_openvino_ready(self, timeout=None) -> bool:
+        app = getattr(og, "my_app", None)
+        if app is None:
+            return False
+        ensure = getattr(app, "ensure_openvino_ready", None)
+        if not callable(ensure):
+            return bool(self.openvino_available)
+        return bool(ensure(timeout=timeout))
+
+    def _hwnd_window(self):
+        device_manager = getattr(og, "device_manager", None)
+        return getattr(device_manager, "hwnd_window", None)
+
+    def game_window_title(self) -> str:
+        hwnd_window = self._hwnd_window()
+        if hwnd_window is None:
+            return ""
+        hwnd = getattr(hwnd_window, "hwnd", 0) or 0
+        if hwnd:
+            try:
+                import win32gui
+
+                return win32gui.GetWindowText(hwnd) or ""
+            except Exception:
+                pass
+        return str(getattr(hwnd_window, "hwnd_title", "") or "")
+
+    def is_game_app_hang(self) -> bool:
+        title = self.game_window_title()
+        return "hang" in title.lower()
+
+    def is_hwnd_present_and_visible(self) -> bool:
+        hwnd_window = self._hwnd_window()
+        if hwnd_window is None:
+            return False
+        hwnd = getattr(hwnd_window, "hwnd", 0) or 0
+        if not hwnd or not getattr(hwnd_window, "exists", False):
+            return False
+        try:
+            import win32gui
+
+            return bool(win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd))
+        except Exception:
+            return bool(getattr(hwnd_window, "exists", False))
+
+    def capture_frame_age_seconds(self) -> float | None:
+        device_manager = getattr(og, "device_manager", None)
+        method = getattr(device_manager, "capture_method", None)
+        last = getattr(method, "last_frame_time", None)
+        if last is None:
+            return None
+        try:
+            return max(0.0, time.time() - float(last))
+        except Exception:
+            return None
+
+    def ensure_capture_ready_for_walk(
+        self,
+        settle_seconds: float = 0.6,
+        min_frames: int = 2,
+        max_frame_age: float = 2.0,
+    ) -> tuple[bool, str]:
+        """Fail-closed gate before holding movement keys (NTE2e-6f6d)."""
+        if self.is_game_app_hang():
+            return False, f"game_app_hang:{self.game_window_title()}"
+        if not self.is_hwnd_present_and_visible():
+            return False, "hwnd_not_visible"
+        got = 0
+        deadline = time.monotonic() + float(settle_seconds)
+        while True:
+            age = self.capture_frame_age_seconds()
+            frame = getattr(self, "frame", None)
+            if frame is not None and (age is None or age <= max_frame_age):
+                got += 1
+                if got >= min_frames:
+                    return True, "ok"
+            if time.monotonic() >= deadline and got < min_frames:
+                break
+            try:
+                self.sleep(0.05)
+            except Exception:
+                time.sleep(0.05)
+            if time.monotonic() >= deadline and got >= 1:
+                # Accept a single fresh frame after settle budget.
+                if frame is not None and (age is None or age <= max_frame_age):
+                    return True, "ok"
+                break
+        if got == 0:
+            return False, "no_frames"
+        return False, "unstable_frames"
 
     def parse_ocr_number(self, ocr_result) -> int:
         if not ocr_result:
@@ -407,6 +514,190 @@ class BaseNTETask(
             raise CannotFindException(msg)
         return success
 
+
+    # Post-teleport budget: FeatureSet/read-image can stall after Labels.teleport
+    # (NTE2e hang0825/hang0855). Fail within a few minutes; Esc may have no hwnd.
+    POST_TELEPORT_TEAM_TIMEOUT = 180
+    # hang1048: is_in_team can hit the stale pre-teleport HUD ~0.5s after the
+    # teleport click. Ignore in-team hits inside this window (fresh frames only).
+    POST_TELEPORT_FRESH_SECONDS = 3.0
+
+    def disarm_post_teleport_watchdog(self, reason: str) -> None:
+        """Close the phase-scoped post-teleport OS watchdog (idempotent)."""
+        wd = self.__dict__.pop("_post_teleport_wd", None)
+        if wd is not None:
+            _disarm_wd(self, wd, reason)
+
+    def wait_in_team_after_teleport(
+        self,
+        time_out=None,
+        raise_if_not_found=True,
+        settle_time=0.25,
+        keep_phase_armed=False,
+    ):
+        """Wait for team HUD after travel with stall budget + fail-closed dump.
+
+        Esc recover is best-effort (hang0855: no window handle). Always dump a
+        screenshot on stall so outer DailyRoutine does not sit 30-60 min.
+
+        hang1003/hang1030: find_one can block after read_from_json OK; an
+        OS-external monotonic watchdog (child process -> trip file / hard kill)
+        fail-closes even if the interpreter is stalled. The wait body runs on a
+        helper so the caller only monitors done/tripped and can disarm in grace.
+        """
+        if time_out is None:
+            time_out = self.POST_TELEPORT_TEAM_TIMEOUT
+        started = time.time()
+        mono_started = time.monotonic()
+        self.log_info(f"wait_in_team_after_teleport time_out={time_out}")
+        fresh_after = getattr(
+            type(self), "POST_TELEPORT_FRESH_SECONDS", BaseNTETask.POST_TELEPORT_FRESH_SECONDS
+        )
+        # A previous phase WD (retry) is superseded by this teleport.
+        if "_post_teleport_wd" in self.__dict__:
+            self.disarm_post_teleport_watchdog("superseded_by_new_teleport")
+
+        done = threading.Event()
+        box = {"success": None, "error": None}
+
+        def on_trip(elapsed: float) -> None:
+            self.log_warning(
+                f"post-teleport is_in_team stall fail-closed: "
+                f"external watchdog after {elapsed:.0f}s"
+            )
+            signal_exit_event(self)
+
+        # Unconditional arm log lives inside arm_external_watchdog
+        # (fs-stall-post_teleport external watchdog armed ...).
+        wd = arm_external_watchdog(
+            timeout=float(time_out),
+            label="post_teleport",
+            on_trip=on_trip,
+            poll_interval=0.2,
+        )
+
+        def cond():
+            if wd.tripped or done.is_set():
+                return None
+            elapsed = time.time() - started
+            if elapsed >= time_out:
+                return None
+            if elapsed < fresh_after:
+                # hang1048: reject stale-HUD in-team hits right after click.
+                return None
+            self.log_info_gated(
+                f"post-teleport wait_in_team elapsed={elapsed:.0f}s/{time_out}",
+                interval=15,
+                key="post_teleport_wait",
+            )
+            # Run is_in_team on the wait helper thread. Full-wait bound is the
+            # external monotonic watchdog (hang1003: join-poll on TaskExecutor
+            # never saw the hung find_one stack).
+            return self.is_in_team()
+
+        def _wait_body():
+            try:
+                box["success"] = self.wait_until(
+                    cond,
+                    time_out=time_out,
+                    raise_if_not_found=False,
+                    settle_time=settle_time,
+                )
+            except FeatureSetStallError as e:
+                box["error"] = e
+                self.log_warning(f"post-teleport is_in_team stall fail-closed: {e}")
+            except Exception as e:
+                box["error"] = e
+                self.log_warning(f"post-teleport wait raised: {e}")
+            finally:
+                done.set()
+
+        waiter = threading.Thread(
+            target=_wait_body,
+            name="fs-stall-post_teleport-wait",
+            daemon=True,
+        )
+        waiter.start()
+
+        # Caller monitors done/tripped — does NOT join find_one.
+        while not done.wait(0.2):
+            if wd.tripped:
+                break
+            if time.monotonic() - mono_started >= float(time_out) + 0.5:
+                break
+
+        if wd.tripped:
+            reason = "tripped"
+        elif not done.is_set():
+            reason = "wait_budget_exceeded"
+        elif box["error"] is not None:
+            reason = f"error:{type(box['error']).__name__}"
+        elif box["success"]:
+            reason = "in_team"
+        else:
+            reason = "in_team_timeout"
+        if reason == "in_team" and keep_phase_armed:
+            # hang1048: real hang is later (walk/find_one on TaskExecutor).
+            # Keep the OS WD armed until interac/combat is confirmed.
+            self._post_teleport_wd = wd
+            self.log_info(
+                "fs-stall-post_teleport kept armed for post-teleport phase "
+                "(until interac/combat confirmed)"
+            )
+        else:
+            _disarm_wd(self, wd, reason)
+        if not done.is_set():
+            # External WD (or budget) fired while waiter still blocked in find_one.
+            done.set()
+
+        if wd.tripped:
+            success = None
+        elif box["error"] is not None and not isinstance(box["error"], FeatureSetStallError):
+            success = None
+        else:
+            success = box["success"]
+
+        if success:
+            self.sleep(0.1)
+            return success
+
+        self.log_warning(
+            f"post-teleport wait_in_team timeout after {time.time() - started:.0f}s; "
+            "Esc/recover best-effort then fail-closed",
+            notify=True,
+        )
+        try:
+            self.screenshot("post_teleport_stall")
+        except Exception as e:
+            self.log_warning(f"post_teleport_stall screenshot failed: {e}")
+
+        # Esc may fail when hwnd/capture is gone (hang0855). Never block on it.
+        try:
+            connected = bool(getattr(self.executor, "connected", lambda: False)())
+            if connected:
+                self.send_key("esc", after_sleep=0.5)
+                self.sleep(0.5)
+                if self.is_in_team():
+                    self.log_info("post-teleport Esc recover: in team")
+                    return True
+                self.ensure_main(time_out=8)
+                if self.is_in_team():
+                    self.log_info("post-teleport ensure_main recover: in team")
+                    return True
+            else:
+                self.log_warning("post-teleport recover skipped: executor not connected / no window handle")
+        except Exception as e:
+            self.log_warning(f"post-teleport Esc/recover failed: {e}")
+
+        if raise_if_not_found:
+            msg = (
+                "传送后主界面/编队检测超时（疑似 FeatureSet/read-image 卡住）。"
+                "已截图 post_teleport_stall；Esc 可能无窗口句柄。"
+            )
+            self.log_error(msg, notify=True)
+            raise CannotFindException(msg)
+        return None
+
     def wait_in_team_and_world(self, time_out=30, raise_if_not_found=True, esc=False):
         success = self.wait_until(
             self.in_team_and_world,
@@ -615,13 +906,32 @@ class BaseNTETask(
 
     def openF1panel(self):
         def action():
-            if self.is_in_team():
-                self.send_key("f1", after_sleep=1)
-                self.log_info("send f1 key to open the panel")
-            return self.wait_panel(Labels.f1_panel)
+            # Panel may already be open (overlay hides team HUD). Accept it first.
+            existing = self.find_one(Labels.f1_panel)
+            if existing:
+                return existing
+            if not self.is_in_team():
+                # Do not wait for f1_panel without sending F1; recover via ensure_main.
+                self.log_warning("openF1panel: not in team; recover overlays before F1")
+                return None
+            self.send_key("f1", after_sleep=1)
+            self.log_info("send f1 key to open the panel")
+            panel = self.wait_panel(Labels.f1_panel)
+            if not panel:
+                # Optional frame dump when key was sent but template missed.
+                try:
+                    self.screenshot("openF1panel_miss")
+                    self.log_warning("openF1panel: Labels.f1_panel miss after F1; dumped frame")
+                except Exception as e:
+                    self.log_warning(f"openF1panel: miss dump failed: {e}")
+            return panel
 
         result = self.retry_on_action(action, self.ensure_main)
         if not result:
+            try:
+                self.screenshot("openF1panel_fail")
+            except Exception:
+                pass
             self.log_error("can't find panel, make sure f1 is the hotkey for panel", notify=True)
             raise CannotFindException("can't find panel, make sure f1 is the hotkey for panel")
         self.sleep(0.5)
@@ -629,13 +939,23 @@ class BaseNTETask(
 
     def openF2panel(self):
         def action():
-            if self.is_in_team():
-                self.send_key("f2", after_sleep=1)
-                self.log_info("send f2 key to open the panel")
+            # Mirror openF1panel: accept already-open panel; do not wait without F2.
+            existing = self.find_one(Labels.f2_panel)
+            if existing:
+                return existing
+            if not self.is_in_team():
+                self.log_warning("openF2panel: not in team; recover overlays before F2")
+                return None
+            self.send_key("f2", after_sleep=1)
+            self.log_info("send f2 key to open the panel")
             return self.wait_panel(Labels.f2_panel)
 
         result = self.retry_on_action(action, self.ensure_main)
         if not result:
+            try:
+                self.screenshot("openF2panel_fail")
+            except Exception:
+                pass
             self.log_error("can't find panel, make sure f2 is the hotkey for panel", notify=True)
             raise CannotFindException("can't find panel, make sure f2 is the hotkey for panel")
         self.sleep(0.5)
@@ -705,12 +1025,19 @@ class BaseNTETask(
         if in_team_or_world:
             self.scene.set_logged_in()
             return True
+        # Monthly card / login are side-effect recoveries only. Never treat them as
+        # "on main": wait_login() returns True whenever scene.logged_in() even if
+        # the ESC phone menu or mail overlay still hides the team HUD (NTE2e
+        # tip 224b274: ensure_main succeeded in ~0.8s while is_in_team stayed false,
+        # so openF1/F2 never sent keys — stuck on ESC apps / mail).
         if self.handle_monthly_card(log=False):
-            return True
-        if self.wait_login():
-            return True
+            return False
+        if not self.scene.logged_in():
+            self.wait_login()
+            return False
         if esc:
             self.send_key("esc", action_name="is_main", interval=2)
+        return False
 
     def find_monthly_card(self):
         return self.find_one(Labels.monthly_card)
@@ -769,11 +1096,25 @@ class BaseNTETask(
             self.next_monthly_card_start = 0
 
     def wait_login(self):
+        if self.scene.logged_in() or self.is_in_team():
+            self._login_wait_started = None
+            self._login_click_count = 0
+            return True
+        if self._login_wait_started is not None and (
+            self._login_click_count >= self.LOGIN_CLICK_LIMIT
+            or time.monotonic() - self._login_wait_started >= self.LOGIN_WAIT_SECONDS
+        ):
+            self._login_wait_started = None
+            self._login_click_count = 0
+            message = "Login did not complete within the retry limit; stopping login input."
+            self.log_error(message)
+            raise WaitFailedException(message)
         if not self.scene.logged_in():
-            if self.is_in_team():
-                return True
             self.handle_monthly_card(log=False)
             if self.find_one(Labels.login_setting):
+                if self._login_wait_started is None:
+                    self._login_wait_started = time.monotonic()
+                self._login_click_count += 1
                 self.log_info("found login_setting, bring_to_front and click")
                 if not self.is_foreground():
                     self.bring_to_front()

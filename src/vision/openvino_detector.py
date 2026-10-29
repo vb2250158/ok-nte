@@ -1,9 +1,11 @@
 import ctypes
+import os
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
-from ok import Box, Logger, og
+from ok import Box, Logger, get_path_relative_to_exe, og
 from ok.ui.qt.Communicate import communicate
 
 logger = Logger.get_logger(__name__)
@@ -15,8 +17,24 @@ class YOLO26OpenVINOAsyncDetector:
     _MAX_RETIRED_INFER_REQUESTS = 10
     _RETIRED_REQUEST_KEEP_SECONDS = 3.0
     _SYNC_WAIT_TIMEOUT = 1.5
+    # NTE2e-6f6d: 4K WGC + OpenCL/ptxas OOM around first compile mid-walk.
+    # Prefer/force CPU; on OpenCL/build failure cache CPU and stay there.
+    _DEFAULT_DEVICE = "CPU"
+    _DEVICE_CACHE_NAME = "openvino_yolo_device.txt"
+    _GPU_BUILD_MARKERS = (
+        "CL_BUILD_PROGRAM_FAILURE",
+        "ptxas",
+        "OpenCL",
+        "clBuildProgram",
+        "MEMORY ALLOCATION FAILURE",
+        "out of memory",
+        "OOM",
+    )
 
-    def __init__(self, xml_path, num_requests=1):
+    def __init__(self, xml_path, num_requests=1, device=None):
+        self._requested_device = device
+        self.device = None
+        self._compiled_model = None
         self._openvino_available = self._supports_avx2()
         self._openvino_unavailable_reason = None
         if not self._openvino_available:
@@ -54,12 +72,9 @@ class YOLO26OpenVINOAsyncDetector:
         ppp.input().model().set_layout(Layout("NCHW"))
         model = ppp.build()
 
-        # 2. 编译模型 (针对 AMD CPU 优化)
-        config = {
-            "PERFORMANCE_HINT": "LATENCY",
-            "INFERENCE_NUM_THREADS": "2",  # 限制线程至 2，降低 CPU 峰值负载
-        }
-        self.compiled_model = self.core.compile_model(model, "CPU", config)
+        # 2. Compile on preferred device (CPU-first). Never leave GPU compile for mid-hunt.
+        self.device = self._resolve_and_compile(model)
+        self.compiled_model = self._compiled_model
 
         self.model_h = 896
         self.model_w = 1536
@@ -80,6 +95,84 @@ class YOLO26OpenVINOAsyncDetector:
         self.job_id = 0
         self._force_next_submit = False
         self.infer_request = self._create_infer_request()
+
+    @classmethod
+    def _device_cache_path(cls) -> Path:
+        try:
+            return Path(get_path_relative_to_exe("cache", cls._DEVICE_CACHE_NAME))
+        except Exception:
+            return Path.cwd() / "cache" / cls._DEVICE_CACHE_NAME
+
+    @classmethod
+    def _read_cached_device(cls) -> str | None:
+        path = cls._device_cache_path()
+        try:
+            value = path.read_text(encoding="utf-8").strip().upper()
+        except OSError:
+            return None
+        return value or None
+
+    @classmethod
+    def _write_cached_device(cls, device: str) -> None:
+        path = cls._device_cache_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(device.upper(), encoding="utf-8")
+        except OSError:
+            logger.warning(f"OpenVINO device cache write failed: {path}")
+
+    @classmethod
+    def _is_gpu_build_failure(cls, error: BaseException) -> bool:
+        message = f"{type(error).__name__}: {error}".upper()
+        return any(marker.upper() in message for marker in cls._GPU_BUILD_MARKERS)
+
+    @classmethod
+    def preferred_devices(cls, requested: str | None = None) -> list[str]:
+        """CPU-first policy; honor explicit request / cache, then fall back to CPU."""
+        env_device = (os.environ.get("OK_NTE_OPENVINO_DEVICE") or "").strip().upper()
+        cached = cls._read_cached_device()
+        ordered: list[str] = []
+        for candidate in (requested, env_device, cached, cls._DEFAULT_DEVICE):
+            if not candidate:
+                continue
+            name = str(candidate).strip().upper()
+            if name and name not in ordered:
+                ordered.append(name)
+        if cls._DEFAULT_DEVICE not in ordered:
+            ordered.append(cls._DEFAULT_DEVICE)
+        return ordered
+
+    def _compile_on_device(self, model, device: str):
+        config = {
+            "PERFORMANCE_HINT": "LATENCY",
+            "INFERENCE_NUM_THREADS": "2",
+        }
+        compiled = self.core.compile_model(model, device, config)
+        logger.info(f"OpenVINO YOLO device={device} (compile ok)")
+        return compiled
+
+    def _resolve_and_compile(self, model) -> str:
+        devices = self.preferred_devices(getattr(self, "_requested_device", None))
+        last_error: BaseException | None = None
+        for device in devices:
+            try:
+                self._compiled_model = self._compile_on_device(model, device)
+                self._write_cached_device(device)
+                return device
+            except BaseException as error:
+                last_error = error
+                logger.warning(f"OpenVINO compile failed on {device}: {error!r}")
+                if device.upper() != self._DEFAULT_DEVICE and self._is_gpu_build_failure(error):
+                    logger.warning(
+                        "OpenVINO OpenCL/GPU build failure; falling back to CPU and caching preference"
+                    )
+                    self._write_cached_device(self._DEFAULT_DEVICE)
+                    continue
+                if device.upper() != self._DEFAULT_DEVICE:
+                    continue
+                raise
+        assert last_error is not None
+        raise last_error
 
     @classmethod
     def _supports_avx2(cls) -> bool:

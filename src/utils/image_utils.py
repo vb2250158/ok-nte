@@ -9,6 +9,24 @@ from ok import Box, color_range_to_bound, get_bounding_box
 from src.events import communicate
 
 
+def as_numpy(image):
+    """Return a host ndarray for OpenCV ops that cannot subscript cv2.UMat."""
+    if image is None:
+        return None
+    if isinstance(image, np.ndarray):
+        return image
+    get = getattr(image, "get", None)
+    if callable(get):
+        try:
+            return get()
+        except Exception:
+            pass
+    try:
+        return np.asarray(image)
+    except Exception:
+        return image
+
+
 def trim_right_background(image, threshold=24):
     """Trim trailing background columns while keeping the image's height and left edge."""
     if image is None or image.size == 0:

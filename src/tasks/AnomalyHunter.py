@@ -204,7 +204,7 @@ class AnomalyHunter(BaseStaminaTask, BaseCombatTask):
         y = y_start + page_idx * self.HUNTER_TRAVEL_Y_STEP
         self.operate_click(self.HUNTER_TRAVEL_X, y)
         self.click_traval_button()
-        self.wait_in_team(time_out=300)
+        self.wait_in_team_after_teleport(keep_phase_armed=True)
 
     def turn_to_next_hunter_page(self):
         self.log_info("异象追猎目标位于下一页，执行翻页")
@@ -215,8 +215,14 @@ class AnomalyHunter(BaseStaminaTask, BaseCombatTask):
         self.sleep(0.5)
 
     def enter_hunter(self, target: str):
-        self.sleep(3)
-        self.walk_until_interac_or_combat(script=self.WALK_METHOD.get(target, ["w"]))
+        try:
+            # Finish OpenVINO compile before movement so it cannot race WGC/4K GPU.
+            self.ensure_openvino_ready()
+            self.sleep(3)
+            self.walk_until_interac_or_combat(script=self.WALK_METHOD.get(target, ["w"]))
+        except BaseException as e:
+            self.disarm_post_teleport_watchdog(f"exception:{type(e).__name__}")
+            raise
         if self.is_in_team() and self.find_interac():
             self.wait_until(
                 lambda: not self.is_in_team(),
@@ -229,10 +235,55 @@ class AnomalyHunter(BaseStaminaTask, BaseCombatTask):
         self, script=[["w"]], time_out=10, run=False, raise_if_not_found=False
     ):
         def cond():
+            if self.is_game_app_hang():
+                from ok import TaskDisabledException
+
+                raise TaskDisabledException(
+                    f"FAIL_CLOSED game_app_hang during hunt: {self.game_window_title()}"
+                )
+            age = self.capture_frame_age_seconds()
+            if age is not None and age > 5.0:
+                from ok import TaskDisabledException
+
+                raise TaskDisabledException(
+                    f"FAIL_CLOSED hunt_no_frames age={age:.1f}s"
+                )
+            if not self.is_hwnd_present_and_visible():
+                from ok import TaskDisabledException
+
+                raise TaskDisabledException("FAIL_CLOSED hwnd_not_visible during hunt")
             return self.find_interac() or self.in_combat()
 
-        if cond():
-            return True
+        # hang1048: post-teleport phase WD (armed in wait_in_team_after_teleport)
+        # stays armed until interac/combat is confirmed here; closed on any exit.
+        reason = "exception"
+        try:
+            if cond():
+                reason = "interac_or_combat_confirmed"
+                return True
+            ready, gate_reason = self.ensure_capture_ready_for_walk()
+            if not ready:
+                self.log_warning(
+                    f"walk gated fail-closed before key-down: {gate_reason}",
+                    notify=True,
+                )
+                reason = f"walk_gate:{gate_reason}"
+                if "hang" in gate_reason:
+                    from ok import TaskDisabledException
+
+                    raise TaskDisabledException(f"FAIL_CLOSED {gate_reason}")
+                return False
+            ret = self._walk_until_interac_or_combat_body(
+                cond, script, time_out, run, raise_if_not_found
+            )
+            reason = "interac_or_combat_confirmed" if ret else "walk_timeout"
+            return ret
+        finally:
+            self.disarm_post_teleport_watchdog(reason)
+
+    def _walk_until_interac_or_combat_body(
+        self, cond, script, time_out, run, raise_if_not_found
+    ):
         direction = script[-1]
         ret = False
         try:

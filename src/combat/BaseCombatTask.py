@@ -20,6 +20,7 @@ from src.sound_trigger.SoundCombatContext import ACTION_UNSET, SoundCombatContex
 from src.tasks.mixin.CharUIMixin import CharElementUIMixin
 from src.utils import game_filters as gf
 from src.utils import image_utils as iu
+from src.utils.phase_watchdog import PhaseTimeout, PhaseWatchdog
 
 logger = Logger.get_logger(__name__)
 cd_regex = re.compile(r"\d{1,2}\.\d")
@@ -442,14 +443,22 @@ class BaseCombatTask(CharElementUIMixin, CombatCheck):
             self.begin_combat_session()
             self.info["Combat Count"] = self.info.get("Combat Count", 0) + 1
             with self.retarget_turn_policy(enable=retarget_turn):
-                deadline = time.time() + max_combat_time
+                idle_timeout = min(180, max_combat_time)
+                watch = PhaseWatchdog(
+                    name="combat_once",
+                    total_timeout=max_combat_time,
+                    idle_timeout=idle_timeout,
+                    on_heartbeat=lambda msg: self.log_info(msg),
+                    heartbeat_interval=30.0,
+                )
                 while self.in_combat():
+                    try:
+                        watch.check()
+                    except PhaseTimeout as e:
+                        self.raise_not_in_combat(str(e))
                     logger.debug(f"combat_once loop {self.chars}")
                     self.get_current_char(raise_exception=True).perform()
-                    if time.time() > deadline:
-                        self.raise_not_in_combat(
-                            f"Combat maximum duration of {max_combat_time}s reached."
-                        )
+                    watch.touch()
         except NotInCombatException as e:
             logger.info(f"combat_once out of combat break {e}")
         finally:

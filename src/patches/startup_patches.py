@@ -15,10 +15,28 @@ def resolve_runtime_ui_mode(config, argv=None) -> str | None:
     return ui_config["type"]
 
 
+def _disable_opencv_opencl() -> None:
+    """Avoid OpenCL/UMat + ptxas OOM under 4K WGC (NTE2e-6f6d)."""
+    try:
+        import cv2
+
+        if hasattr(cv2, "ocl") and hasattr(cv2.ocl, "setUseOpenCL"):
+            cv2.ocl.setUseOpenCL(False)
+            from ok import Logger
+
+            Logger.get_logger(__name__).info(
+                f"OpenCV OpenCL disabled (useOpenCL={cv2.ocl.useOpenCL()})"
+            )
+    except Exception:
+        pass
+
+
 def install_startup_patches(config):
     global _PATCH_INSTALLED
     if _PATCH_INSTALLED:
         return
+
+    _disable_opencv_opencl()
 
     from src.ui.task_icons import Icon
 
@@ -28,6 +46,10 @@ def install_startup_patches(config):
     from src.patches.i18n_patch import install_i18n_patch
 
     install_i18n_patch()
+
+    from src.patches.featureset_stall_patch import install_featureset_stall_patch
+
+    install_featureset_stall_patch()
     # if ui_mode == "qt":
     #     from src.patches.task_tab_patch import install_task_tab_patch
 
