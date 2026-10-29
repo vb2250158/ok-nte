@@ -735,13 +735,23 @@ class BaseNTETask(
 
     def openF2panel(self):
         def action():
-            if self.is_in_team():
-                self.send_key("f2", after_sleep=1)
-                self.log_info("send f2 key to open the panel")
+            # Mirror openF1panel: accept already-open panel; do not wait without F2.
+            existing = self.find_one(Labels.f2_panel)
+            if existing:
+                return existing
+            if not self.is_in_team():
+                self.log_warning("openF2panel: not in team; recover overlays before F2")
+                return None
+            self.send_key("f2", after_sleep=1)
+            self.log_info("send f2 key to open the panel")
             return self.wait_panel(Labels.f2_panel)
 
         result = self.retry_on_action(action, self.ensure_main)
         if not result:
+            try:
+                self.screenshot("openF2panel_fail")
+            except Exception:
+                pass
             self.log_error("can't find panel, make sure f2 is the hotkey for panel", notify=True)
             raise CannotFindException("can't find panel, make sure f2 is the hotkey for panel")
         self.sleep(0.5)
@@ -811,12 +821,19 @@ class BaseNTETask(
         if in_team_or_world:
             self.scene.set_logged_in()
             return True
+        # Monthly card / login are side-effect recoveries only. Never treat them as
+        # "on main": wait_login() returns True whenever scene.logged_in() even if
+        # the ESC phone menu or mail overlay still hides the team HUD (NTE2e
+        # tip 224b274: ensure_main succeeded in ~0.8s while is_in_team stayed false,
+        # so openF1/F2 never sent keys — stuck on ESC apps / mail).
         if self.handle_monthly_card(log=False):
-            return True
-        if self.wait_login():
-            return True
+            return False
+        if not self.scene.logged_in():
+            self.wait_login()
+            return False
         if esc:
             self.send_key("esc", action_name="is_main", interval=2)
+        return False
 
     def find_monthly_card(self):
         return self.find_one(Labels.monthly_card)
