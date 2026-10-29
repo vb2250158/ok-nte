@@ -411,6 +411,89 @@ class BaseNTETask(
             raise CannotFindException(msg)
         return success
 
+
+    # Post-teleport budget: FeatureSet/read-image can stall after Labels.teleport
+    # (NTE2e hang0825/hang0855). Fail within a few minutes; Esc may have no hwnd.
+    POST_TELEPORT_TEAM_TIMEOUT = 180
+
+    def wait_in_team_after_teleport(
+        self,
+        time_out=None,
+        raise_if_not_found=True,
+        settle_time=0.25,
+    ):
+        """Wait for team HUD after travel with stall budget + fail-closed dump.
+
+        Esc recover is best-effort (hang0855: no window handle). Always dump a
+        screenshot on stall so outer DailyRoutine does not sit 30–40 min.
+        """
+        if time_out is None:
+            time_out = self.POST_TELEPORT_TEAM_TIMEOUT
+        started = time.time()
+        self.log_info(f"wait_in_team_after_teleport time_out={time_out}")
+
+        def cond():
+            elapsed = time.time() - started
+            self.log_info_gated(
+                f"post-teleport wait_in_team elapsed={elapsed:.0f}s/{time_out}",
+                interval=15,
+                key="post_teleport_wait",
+            )
+            return self.is_in_team()
+
+        try:
+            success = self.wait_until(
+                cond,
+                time_out=time_out,
+                raise_if_not_found=False,
+                settle_time=settle_time,
+            )
+        except Exception as e:
+            # FeatureSetStallError or capture errors during find
+            self.log_warning(f"post-teleport wait raised: {e}")
+            success = None
+
+        if success:
+            self.sleep(0.1)
+            return success
+
+        self.log_warning(
+            f"post-teleport wait_in_team timeout after {time.time() - started:.0f}s; "
+            "Esc/recover best-effort then fail-closed",
+            notify=True,
+        )
+        try:
+            self.screenshot("post_teleport_stall")
+        except Exception as e:
+            self.log_warning(f"post_teleport_stall screenshot failed: {e}")
+
+        # Esc may fail when hwnd/capture is gone (hang0855). Never block on it.
+        try:
+            connected = bool(getattr(self.executor, "connected", lambda: False)())
+            if connected:
+                self.send_key("esc", after_sleep=0.5)
+                self.sleep(0.5)
+                if self.is_in_team():
+                    self.log_info("post-teleport Esc recover: in team")
+                    return True
+                self.ensure_main(time_out=8)
+                if self.is_in_team():
+                    self.log_info("post-teleport ensure_main recover: in team")
+                    return True
+            else:
+                self.log_warning("post-teleport recover skipped: executor not connected / no window handle")
+        except Exception as e:
+            self.log_warning(f"post-teleport Esc/recover failed: {e}")
+
+        if raise_if_not_found:
+            msg = (
+                "传送后主界面/编队检测超时（疑似 FeatureSet/read-image 卡住）。"
+                "已截图 post_teleport_stall；Esc 可能无窗口句柄。"
+            )
+            self.log_error(msg, notify=True)
+            raise CannotFindException(msg)
+        return None
+
     def wait_in_team_and_world(self, time_out=30, raise_if_not_found=True, esc=False):
         success = self.wait_until(
             self.in_team_and_world,

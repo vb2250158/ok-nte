@@ -28,6 +28,10 @@ def install_startup_patches(config):
     from src.patches.i18n_patch import install_i18n_patch
 
     install_i18n_patch()
+
+    from src.patches.featureset_stall_patch import install_featureset_stall_patch
+
+    install_featureset_stall_patch()
     # if ui_mode == "qt":
     #     from src.patches.task_tab_patch import install_task_tab_patch
 
