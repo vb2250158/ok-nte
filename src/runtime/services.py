@@ -1,7 +1,8 @@
 """Background services started after the application runtime becomes ready."""
 
 import threading
-from concurrent.futures import Future, InvalidStateError
+from concurrent.futures import CancelledError, Future, InvalidStateError
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from threading import Event
 
 from ok import Logger, get_path_relative_to_exe
@@ -11,6 +12,10 @@ logger = Logger.get_logger(__name__)
 
 class RuntimeServices:
     """Own startup and shutdown for the sound and OpenVINO runtime services."""
+
+    # Bounded first wait for the detector. Callers poll every frame, so after
+    # this one wait the model is only picked up once ready (never blocks again).
+    OPENVINO_WAIT_TIMEOUT = 3.0
 
     def __init__(self) -> None:
         if threading.current_thread() is not threading.main_thread():
@@ -23,6 +28,9 @@ class RuntimeServices:
         self._started = False
         self._openvino_model_async = None
         self._openvino_model_future = Future()
+        self._openvino_lock = threading.Lock()
+        self._openvino_init_started = False
+        self._openvino_wait_exhausted = False
 
     def start(self) -> None:
         if self._started or self._stop_event.is_set():
@@ -33,6 +41,15 @@ class RuntimeServices:
             daemon=True,
             name="SoundContextInit",
         ).start()
+        self._ensure_openvino_init()
+
+    def _ensure_openvino_init(self) -> None:
+        # Headless `-t` runs never emit start_success, so start() never runs;
+        # the first detector query must start the loader itself.
+        with self._openvino_lock:
+            if self._openvino_init_started or self._stop_event.is_set():
+                return
+            self._openvino_init_started = True
         threading.Thread(
             target=self._init_openvino,
             daemon=True,
@@ -54,11 +71,28 @@ class RuntimeServices:
     def openvino_model_async(self):
         if self._openvino_model_async is not None:
             return self._openvino_model_async
-        return self._openvino_model_future.result()
+        self._ensure_openvino_init()
+        timeout = 0 if self._openvino_wait_exhausted else self.OPENVINO_WAIT_TIMEOUT
+        try:
+            return self._openvino_model_future.result(timeout=timeout)
+        except FutureTimeoutError:
+            if not self._openvino_wait_exhausted:
+                self._openvino_wait_exhausted = True
+                logger.warning(
+                    f"OpenVINO detector not ready after {timeout:.1f}s; "
+                    "treating it as unavailable until it loads"
+                )
+            return None
+        except (CancelledError, Exception) as error:
+            if not self._openvino_wait_exhausted:
+                self._openvino_wait_exhausted = True
+                logger.warning(f"OpenVINO detector unavailable: {error!r}")
+            return None
 
     @property
     def openvino_latency_async(self):
-        return self._openvino_model_async.latency
+        model = self._openvino_model_async
+        return model.latency if model is not None else 0
 
     @property
     def openvino_latest_image(self):
@@ -66,13 +100,17 @@ class RuntimeServices:
 
     @property
     def openvino_available(self):
-        return self.openvino_model_async._openvino_available
+        model = self.openvino_model_async
+        return bool(model is not None and model._openvino_available)
 
     def openvino_detect(
         self, image, sync=False, box=None, threshold=0.5, force=False, mask_regions=None
     ):
+        model = self.openvino_model_async
+        if model is None:
+            return []
         if not sync:
-            return self.openvino_model_async.detect(
+            return model.detect(
                 image,
                 box=box,
                 threshold=threshold,
@@ -80,7 +118,7 @@ class RuntimeServices:
                 force=force,
                 mask_regions=mask_regions,
             )
-        return self.openvino_model_async.detect_sync(
+        return model.detect_sync(
             image,
             box=box,
             threshold=threshold,
@@ -89,7 +127,9 @@ class RuntimeServices:
         )
 
     def openvino_clear_cache(self) -> None:
-        self.openvino_model_async.clear_cache()
+        model = self.openvino_model_async
+        if model is not None:
+            model.clear_cache()
 
     def _init_sound_context(self) -> None:
         from src.sound_trigger.SoundCombatContext import SoundCombatContext

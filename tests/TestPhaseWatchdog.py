@@ -1,3 +1,4 @@
+import os
 import subprocess
 import threading
 import time
@@ -544,6 +545,32 @@ class TestPostTeleportPhaseWatchdog(unittest.TestCase):
             if sacrificial.poll() is None:
                 sacrificial.kill()
                 sacrificial.wait(timeout=2)
+
+
+_FS_STALL_GLOB = "ok-nte-fs-stall-*"
+_fs_stall_before = set()
+
+
+def setUpModule():
+    import glob
+    import tempfile
+
+    _fs_stall_before.update(glob.glob(os.path.join(tempfile.gettempdir(), _FS_STALL_GLOB)))
+
+
+def tearDownModule():
+    # Watchdog tests create .trip/.disarm/.stack.txt markers in %TEMP%;
+    # remove only markers that appeared while this module ran.
+    import glob
+    import tempfile
+
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), _FS_STALL_GLOB)):
+        if path in _fs_stall_before:
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
