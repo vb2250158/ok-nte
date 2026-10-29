@@ -4,6 +4,12 @@ Evidence (NTE2e 2026-10-29 Asia/Hong_Kong):
 - hang0825 / first-run: teleport @08:24:47 -> read_from_json @08:25:01 then ~27 min silence
 - hang0855: teleport @08:55:17 -> read_from_json @08:55:22 then stall to 09:00 kill;
   WGC NULL COM in .err; Esc recover may have no window handle
+- hang0938: is_in_team/find_one wedged after read_from_json OK; wait_condition
+  only checked 180s after condition() returned
+- hang1003: tip 85cb49d loaded, but hang stayed on TaskExecutor inside find_one
+  (not fs-stall-post_teleport helper). join-poll never monitored the hung stack;
+  ~398s silence, no fail-closed. Need an EXTERNAL monotonic watchdog that does
+  not depend on TaskExecutor returning from find_one.
 
 Fail the image load within ~3 min so callers can fail-closed with evidence
 instead of waiting DailyRoutine outer timeout.
@@ -28,6 +34,111 @@ class FeatureSetStallError(RuntimeError):
     """Feature template reload exceeded the stall budget."""
 
 
+class ExternalMonotonicWatchdog:
+    """Fail-closed wall clock on a side thread (hang1003).
+
+    Does not join the hung callee. Trips via on_trip / tripped flag / exit_event
+    even when TaskExecutor is blocked inside find_one.
+    """
+
+    def __init__(
+        self,
+        timeout: float,
+        label: str,
+        on_trip=None,
+        poll_interval: float = 0.2,
+    ):
+        self.timeout = max(0.0, float(timeout))
+        self.label = label
+        self.on_trip = on_trip
+        self.poll_interval = max(0.05, float(poll_interval))
+        self.tripped = False
+        self._done = threading.Event()
+        self._thread = None
+        self.started_mono = None
+
+    def arm(self) -> "ExternalMonotonicWatchdog":
+        # Unconditional engagement log so live runs prove wrap is active.
+        logger.info(
+            f"fs-stall-{self.label} external watchdog armed "
+            f"timeout={self.timeout:.0f}s"
+        )
+        self.started_mono = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"fs-stall-{self.label}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        deadline = (self.started_mono or time.monotonic()) + self.timeout
+        while not self._done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.tripped = True
+                elapsed = time.monotonic() - (self.started_mono or deadline)
+                logger.error(
+                    f"fs-stall-{self.label} external watchdog TRIPPED "
+                    f"after {elapsed:.0f}s"
+                )
+                if self.on_trip is not None:
+                    try:
+                        self.on_trip(elapsed)
+                    except Exception as exc:  # noqa: BLE001 - never raise from WD
+                        logger.error(
+                            f"fs-stall-{self.label} on_trip failed: {exc}"
+                        )
+                return
+            self._done.wait(min(self.poll_interval, remaining))
+
+    def close(self) -> None:
+        self._done.set()
+
+
+def arm_external_watchdog(
+    timeout: float,
+    label: str,
+    on_trip=None,
+    poll_interval: float = 0.2,
+) -> ExternalMonotonicWatchdog:
+    return ExternalMonotonicWatchdog(
+        timeout=timeout,
+        label=label,
+        on_trip=on_trip,
+        poll_interval=poll_interval,
+    ).arm()
+
+
+def signal_exit_event(owner=None) -> bool:
+    """Best-effort set ok exit_event for fail-closed (hang1003)."""
+    candidates = []
+    if owner is not None:
+        ex = getattr(owner, "executor", None)
+        if ex is not None:
+            candidates.append(getattr(ex, "exit_event", None))
+        candidates.append(getattr(owner, "exit_event", None))
+    try:
+        from ok import og
+
+        candidates.append(getattr(og, "exit_event", None))
+        ok_instance = getattr(og, "ok", None) or getattr(og, "ok_instance", None)
+        if ok_instance is not None:
+            candidates.append(getattr(ok_instance, "exit_event", None))
+    except Exception:
+        pass
+    for ev in candidates:
+        if ev is None or not hasattr(ev, "set"):
+            continue
+        try:
+            ev.set()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"exit_event.set failed: {exc}")
+    return False
+
+
 def _run_with_timeout(
     func,
     timeout: float,
@@ -41,6 +152,9 @@ def _run_with_timeout(
     Polls `join` so optional `on_heartbeat` can keep gated elapsed logs
     alive while the callee (e.g. is_in_team/find_one) is wedged after
     read_from_json already returned OK (hang0938).
+
+    hang1003: this alone is insufficient when the hung stack is the caller
+    (TaskExecutor) itself — use ExternalMonotonicWatchdog for that case.
     """
     result = []
     error = []

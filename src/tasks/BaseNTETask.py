@@ -32,7 +32,8 @@ from src.utils import vision_utils as vu
 from src.utils.log_gate import LogGateMixin
 from src.patches.featureset_stall_patch import (
     FeatureSetStallError,
-    _run_with_timeout,
+    arm_external_watchdog,
+    signal_exit_event,
 )
 
 logger = Logger.get_logger(__name__)
@@ -429,57 +430,96 @@ class BaseNTETask(
         """Wait for team HUD after travel with stall budget + fail-closed dump.
 
         Esc recover is best-effort (hang0855: no window handle). Always dump a
-        screenshot on stall so outer DailyRoutine does not sit 30–40 min.
+        screenshot on stall so outer DailyRoutine does not sit 30-60 min.
+
+        hang1003: find_one can block ON TaskExecutor after read_from_json OK.
+        An EXTERNAL monotonic watchdog (side thread -> exit_event) fail-closes
+        without depending on TaskExecutor returning from find_one. The wait body
+        runs on a helper so the caller only monitors done/tripped.
         """
         if time_out is None:
             time_out = self.POST_TELEPORT_TEAM_TIMEOUT
         started = time.time()
+        mono_started = time.monotonic()
         self.log_info(f"wait_in_team_after_teleport time_out={time_out}")
 
-        def _heartbeat(blocked_for: float) -> None:
-            # Keep gated elapsed alive while is_in_team/find_one is wedged
-            # (hang0938: wait_condition only checks budget AFTER condition returns).
-            elapsed = time.time() - started
-            self.log_info_gated(
-                f"post-teleport wait_in_team elapsed={elapsed:.0f}s/{time_out} "
-                f"(is_in_team blocked {blocked_for:.0f}s)",
-                interval=15,
-                key="post_teleport_wait",
+        done = threading.Event()
+        box = {"success": None, "error": None}
+
+        def on_trip(elapsed: float) -> None:
+            self.log_warning(
+                f"post-teleport is_in_team stall fail-closed: "
+                f"external watchdog after {elapsed:.0f}s"
             )
+            signal_exit_event(self)
+
+        # Unconditional arm log lives inside arm_external_watchdog
+        # (fs-stall-post_teleport external watchdog armed ...).
+        wd = arm_external_watchdog(
+            timeout=float(time_out),
+            label="post_teleport",
+            on_trip=on_trip,
+            poll_interval=0.2,
+        )
 
         def cond():
+            if wd.tripped or done.is_set():
+                return None
             elapsed = time.time() - started
-            remaining = time_out - elapsed
-            if remaining <= 0:
+            if elapsed >= time_out:
                 return None
             self.log_info_gated(
                 f"post-teleport wait_in_team elapsed={elapsed:.0f}s/{time_out}",
                 interval=15,
                 key="post_teleport_wait",
             )
-            # Wall-clock around full is_in_team/find_one path (not only read_from_json).
-            return _run_with_timeout(
-                lambda: self.is_in_team(),
-                remaining,
-                "post_teleport_is_in_team",
-                on_heartbeat=_heartbeat,
-                heartbeat_interval=15.0,
-            )
+            # Run is_in_team on the wait helper thread. Full-wait bound is the
+            # external monotonic watchdog (hang1003: join-poll on TaskExecutor
+            # never saw the hung find_one stack).
+            return self.is_in_team()
 
-        try:
-            success = self.wait_until(
-                cond,
-                time_out=time_out,
-                raise_if_not_found=False,
-                settle_time=settle_time,
-            )
-        except FeatureSetStallError as e:
-            self.log_warning(f"post-teleport is_in_team stall fail-closed: {e}")
+        def _wait_body():
+            try:
+                box["success"] = self.wait_until(
+                    cond,
+                    time_out=time_out,
+                    raise_if_not_found=False,
+                    settle_time=settle_time,
+                )
+            except FeatureSetStallError as e:
+                box["error"] = e
+                self.log_warning(f"post-teleport is_in_team stall fail-closed: {e}")
+            except Exception as e:
+                box["error"] = e
+                self.log_warning(f"post-teleport wait raised: {e}")
+            finally:
+                done.set()
+
+        waiter = threading.Thread(
+            target=_wait_body,
+            name="fs-stall-post_teleport-wait",
+            daemon=True,
+        )
+        waiter.start()
+
+        # Caller monitors done/tripped — does NOT join find_one.
+        while not done.wait(0.2):
+            if wd.tripped:
+                break
+            if time.monotonic() - mono_started >= float(time_out) + 0.5:
+                break
+
+        wd.close()
+        if not done.is_set():
+            # External WD (or budget) fired while waiter still blocked in find_one.
+            done.set()
+
+        if wd.tripped:
             success = None
-        except Exception as e:
-            # capture errors during find
-            self.log_warning(f"post-teleport wait raised: {e}")
+        elif box["error"] is not None and not isinstance(box["error"], FeatureSetStallError):
             success = None
+        else:
+            success = box["success"]
 
         if success:
             self.sleep(0.1)

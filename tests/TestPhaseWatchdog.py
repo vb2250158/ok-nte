@@ -1,3 +1,4 @@
+import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -7,7 +8,9 @@ from src.patches.featureset_stall_patch import (
     FEATURESET_READ_TIMEOUT_SECONDS,
     FeatureSetStallError,
     _run_with_timeout,
+    arm_external_watchdog,
     install_featureset_stall_patch,
+    signal_exit_event,
 )
 from src.tasks.BaseNTETask import BaseNTETask
 from src.utils.phase_watchdog import PhaseTimeout, PhaseWatchdog
@@ -147,7 +150,7 @@ class TestWaitInTeamAfterTeleport(unittest.TestCase):
         """hang0938: if is_in_team/find_one blocks past budget, wait fails closed.
 
         wait_condition only checks the 180s budget AFTER condition() returns, so
-        a wedged find_one starved the outer timeout. Bounded is_in_team must trip.
+        a wedged find_one starved the outer timeout. External WD must trip.
         """
         from src.utils.log_gate import LogGateMixin
 
@@ -165,6 +168,7 @@ class TestWaitInTeamAfterTeleport(unittest.TestCase):
                 self.ensure_main = Mock()
                 self.executor = Mock()
                 self.executor.connected = Mock(return_value=False)
+                self.executor.exit_event = __import__("threading").Event()
 
             def is_in_team(self, frame=None):
                 # Simulate find_one wedged after read_from_json ok
@@ -189,6 +193,91 @@ class TestWaitInTeamAfterTeleport(unittest.TestCase):
         # Stall path logged
         warn_msgs = " ".join(str(c) for c in task.log_warning.call_args_list)
         self.assertIn("stall", warn_msgs.lower())
+
+    def test_caller_thread_native_hang_external_watchdog(self):
+        """hang1003: hung stack on caller/wait thread (not GIL-releasing sleep stub).
+
+        Live: TaskExecutor blocked inside find_one after read_from_json OK;
+        join-poll on fs-stall helper never monitored that stack. Busy-spin
+        holds the waiter like a native block; external monotonic WD must
+        fail-closed + exit_event without waiting for the hang to finish.
+        """
+        import threading
+        from src.utils.log_gate import LogGateMixin
+
+        class _Task(LogGateMixin):
+            POST_TELEPORT_TEAM_TIMEOUT = 180
+
+            def __init__(self):
+                super().__init__()
+                self.log_info = Mock()
+                self.log_warning = Mock()
+                self.log_error = Mock()
+                self.sleep = Mock()
+                self.screenshot = Mock()
+                self.send_key = Mock()
+                self.ensure_main = Mock()
+                self.executor = Mock()
+                self.executor.connected = Mock(return_value=False)
+                self.executor.exit_event = threading.Event()
+                self.hang_entered = threading.Event()
+                self.hang_finished = threading.Event()
+
+            def is_in_team(self, frame=None):
+                # Native-like: busy-spin holds this thread (GIL in bursts).
+                # time.sleep would release GIL and not match hang1003.
+                self.hang_entered.set()
+                end = time.monotonic() + 8.0
+                while time.monotonic() < end:
+                    # CPU-bound slice; do not sleep
+                    total = 0
+                    for i in range(50000):
+                        total += i
+                    if self.executor.exit_event.is_set():
+                        break
+                self.hang_finished.set()
+                return False
+
+            def wait_until(self, cond, time_out=None, raise_if_not_found=False, settle_time=0.25):
+                # Mimic wait_condition: invoke cond on THIS (waiter) thread and
+                # block until it returns — same morphology as live find_one.
+                return cond()
+
+        task = _Task()
+        task.wait_in_team_after_teleport = (
+            BaseNTETask.wait_in_team_after_teleport.__get__(task, BaseNTETask)
+        )
+        t0 = time.monotonic()
+        with self.assertRaises(CannotFindException):
+            task.wait_in_team_after_teleport(time_out=0.5)
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 2.5, f"external WD did not fail-closed in time: {elapsed:.2f}s")
+        self.assertTrue(task.hang_entered.wait(1.0), "hang never entered")
+        self.assertTrue(
+            task.executor.exit_event.is_set(),
+            "external WD must set exit_event (fail-closed)",
+        )
+        task.screenshot.assert_called_with("post_teleport_stall")
+        warn_msgs = " ".join(str(c) for c in task.log_warning.call_args_list)
+        self.assertIn("external watchdog", warn_msgs.lower())
+
+
+class TestExternalMonotonicWatchdog(unittest.TestCase):
+    def test_arm_log_and_trip(self):
+        import threading
+
+        tripped = threading.Event()
+        seen = {}
+
+        def on_trip(elapsed):
+            seen["elapsed"] = elapsed
+            tripped.set()
+
+        wd = arm_external_watchdog(0.3, "unit_post_teleport", on_trip=on_trip)
+        self.assertTrue(tripped.wait(2.0))
+        self.assertTrue(wd.tripped)
+        wd.close()
+        self.assertGreaterEqual(seen.get("elapsed", 0), 0.2)
 
 
 class TestCombatOnceWatchdog(unittest.TestCase):
